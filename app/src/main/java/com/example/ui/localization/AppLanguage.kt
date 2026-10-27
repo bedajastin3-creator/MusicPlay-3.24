@@ -13,7 +13,11 @@ enum class AppLanguage(
     ENGLISH("en", "English", "English", "🇺🇸", false),
     FRENCH("fr", "French", "Français", "🇫🇷", false),
     PORTUGUESE("pt", "Portuguese", "Português", "🇵🇹", false),
-    ARABIC("ar", "Arabic", "العربية", "🇸🇦", true);
+    ARABIC("ar", "Arabic", "العربية", "🇸🇦", true),
+    CHINESE("zh", "Chinese", "中文", "🇨🇳", false),
+    HINDI("hi", "Hindi", "हिन्दी", "🇮🇳", false),
+    JAPANESE("ja", "Japanese", "日本語", "🇯🇵", false),
+    RUSSIAN("ru", "Russian", "Русский", "🇷🇺", false);
 
     val layoutDirection: LayoutDirection
         get() = if (isRtl) LayoutDirection.Rtl else LayoutDirection.Ltr

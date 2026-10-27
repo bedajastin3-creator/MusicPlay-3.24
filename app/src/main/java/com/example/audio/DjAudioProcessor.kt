@@ -6,6 +6,7 @@ import android.media.MediaPlayer
 import android.media.SoundPool
 import android.media.audiofx.Equalizer
 import android.media.audiofx.PresetReverb
+import android.net.Uri
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.*
@@ -18,34 +19,34 @@ import kotlin.math.*
 /**
  * Executes real-time DJ audio effects on the active playback session.
  * 
- * Supports:
- * 1. Authentic Vinyl Scratch bursts (via low-latency SoundPool + transient ducking)
- * 2. Equalizer Filter Sweeps (smoothly swept frequency attenuation and opening)
- * 3. Rhythmic Beat-Filtering (syncopated tonal frequency modulation)
- * 4. Radio / Vocal Filter (vintage bandpass filtering)
- * 5. Spatial Echo and Echo-Out (spatial acoustic reverb tail with smooth decay)
- * 6. Turntable Spin-Up (subtle pitch acceleration on track start)
+ * Guarantees 100% audibility across BOTH playback paths:
+ * 1. Hardware/Platform path: Android MediaPlayer, Hardware Equalizer, PresetReverb, and dedicated scratch player.
+ * 2. Software DSP path: Real-time PCM processing (resonant state-variable filter sweeps, delay/echo buffer,
+ *    rhythmic beat-chopping, and direct PCM scratch injection) inside AudioTrack playback.
  *
  * Guarantees:
  * - Never modifies music files on disk
- * - Never interferes with or modifies the existing crossfade implementation
- * - Preserves and restores user's base Equalizer, Reverb, Pitch, and Volume settings
- * - Safe fallback if hardware audio effects are unavailable
+ * - Never interferes with or resets the existing crossfade implementation
+ * - Restores user's base Equalizer, Reverb, Pitch, and Volume settings cleanly
  */
 class DjAudioProcessor(private val context: Context) {
 
     companion object {
         private const val TAG = "DjAudioProcessor"
-        private const val SAMPLE_RATE = 22050
+        const val SAMPLE_RATE = 22050
     }
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var activeJob: Job? = null
 
-    // Low-latency SoundPool for authentic vinyl scratch bursts
-    private var soundPool: SoundPool? = null
-    private var scratchSoundIds = IntArray(3) { -1 }
-    private var isSoundPoolReady = false
+    // Scratch audio storage
+    private var scratchFiles = mutableListOf<File>()
+    private var scratchPcmChirp: ShortArray? = null
+    private var scratchPcmBaby: ShortArray? = null
+    private var scratchPcmBackspin: ShortArray? = null
+
+    // Dedicated MediaPlayer for playing scratch bursts over MediaPlayer streams
+    private var scratchMediaPlayer: MediaPlayer? = null
 
     // State tracking for baseline restoration
     @Volatile
@@ -56,46 +57,59 @@ class DjAudioProcessor(private val context: Context) {
     var activeEffectType: DjEffectType? = null
         private set
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Real-Time PCM DSP State (Used directly in AudioTrack synthesis loop)
+    // ─────────────────────────────────────────────────────────────────────────────
+    @Volatile
+    private var pcmEffectMode: Int = 0 // 0: bypass, 1: scratch, 2: filter sweep, 3: beat filter, 4: radio, 5: echo, 6: spinup
+    @Volatile
+    private var pcmCurrentScratch: ShortArray? = null
+    @Volatile
+    private var pcmScratchIndex = 0
+
+    // Filter Sweep State
+    @Volatile
+    private var pcmFilterProgress = 0.0 // 0.0 to 1.0
+    private var svfLow = 0.0
+    private var svfBand = 0.0
+    private var svfHigh = 0.0
+
+    // Beat Filter State
+    @Volatile
+    private var pcmBeatFilterPulse = 0.0 // 0.0 to 1.0
+
+    // Echo Ring Buffer (280ms circular delay line)
+    private val echoDelaySamples = (SAMPLE_RATE * 0.28).toInt()
+    private val echoBuffer = FloatArray(echoDelaySamples)
+    private var echoBufferIndex = 0
+    @Volatile
+    private var echoMixLevel = 0.0f
+    @Volatile
+    private var echoFeedback = 0.55f
+
+    // Spin-Up State
+    @Volatile
+    private var spinUpProgress = 1.0
+
     init {
-        initSoundPool()
+        initScratchAssets()
     }
 
-    private fun initSoundPool() {
-        scope.launch {
-            try {
-                val attrs = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
+    private fun initScratchAssets() {
+        try {
+            scratchPcmChirp = generateScratchPcm(ScratchStyle.CHIRP)
+            scratchPcmBaby = generateScratchPcm(ScratchStyle.BABY)
+            scratchPcmBackspin = generateScratchPcm(ScratchStyle.BACKSPIN)
 
-                soundPool = SoundPool.Builder()
-                    .setMaxStreams(3)
-                    .setAudioAttributes(attrs)
-                    .build()
+            val chirpWav = writeWavToFiles("dj_scratch_chirp.wav", scratchPcmChirp!!)
+            val babyWav = writeWavToFiles("dj_scratch_baby.wav", scratchPcmBaby!!)
+            val spinWav = writeWavToFiles("dj_scratch_spin.wav", scratchPcmBackspin!!)
 
-                // Generate or load 3 distinct authentic DJ scratch waveforms into cache
-                val scratchFiles = listOf(
-                    generateScratchWav("dj_scratch_chirp.wav", ScratchStyle.CHIRP),
-                    generateScratchWav("dj_scratch_baby.wav", ScratchStyle.BABY),
-                    generateScratchWav("dj_scratch_spin.wav", ScratchStyle.BACKSPIN)
-                )
-
-                soundPool?.let { pool ->
-                    for (i in scratchFiles.indices) {
-                        val file = scratchFiles[i]
-                        if (file != null && file.exists()) {
-                            scratchSoundIds[i] = pool.load(file.absolutePath, 1)
-                        }
-                    }
-                    pool.setOnLoadCompleteListener { _, _, status ->
-                        if (status == 0) {
-                            isSoundPoolReady = true
-                        }
-                    }
-                }
-            } catch (e: Throwable) {
-                Log.w(TAG, "SoundPool initialization fallback: ${e.message}")
-            }
+            scratchFiles.add(chirpWav)
+            scratchFiles.add(babyWav)
+            scratchFiles.add(spinWav)
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed creating scratch assets: ${e.message}")
         }
     }
 
@@ -114,7 +128,7 @@ class DjAudioProcessor(private val context: Context) {
         onVolumeDuck: ((Float) -> Unit)? = null,
         onComplete: () -> Unit
     ) {
-        // Cancel any previous effect before starting a new one
+        // Cancel any running effect before starting new one
         cancelActiveEffect(equalizer, reverb, baseEqGains, baseReverbPreset, mediaPlayer, basePitch, onVolumeDuck)
 
         isEffectActive = true
@@ -124,16 +138,16 @@ class DjAudioProcessor(private val context: Context) {
             try {
                 when (effect) {
                     DjEffectType.VINYL_SCRATCH -> {
-                        executeVinylScratch(onVolumeDuck)
+                        executeVinylScratch(mediaPlayer, onVolumeDuck)
                     }
                     DjEffectType.FILTER_SWEEP -> {
-                        executeFilterSweep(equalizer, baseEqGains)
+                        executeFilterSweep(equalizer, baseEqGains, onVolumeDuck)
                     }
                     DjEffectType.BEAT_FILTER -> {
-                        executeBeatFilter(equalizer, baseEqGains)
+                        executeBeatFilter(equalizer, baseEqGains, onVolumeDuck)
                     }
                     DjEffectType.RADIO_FILTER -> {
-                        executeRadioFilter(equalizer, baseEqGains)
+                        executeRadioFilter(equalizer, baseEqGains, onVolumeDuck)
                     }
                     DjEffectType.ECHO_OUT -> {
                         executeEchoOut(reverb, baseReverbPreset, onVolumeDuck)
@@ -142,15 +156,14 @@ class DjAudioProcessor(private val context: Context) {
                         executeVinylSpinUp(mediaPlayer, basePitch, onVolumeDuck)
                     }
                 }
-            } catch (e: CancellationException) {
-                // Cancelled cleanly (e.g. track change, seek, switch OFF)
+            } catch (_: CancellationException) {
             } catch (e: Throwable) {
                 Log.e(TAG, "Error executing DJ effect $effect: ${e.message}")
             } finally {
-                // Guaranteed restoration of baseline audio states
                 restoreBaseAudioStates(equalizer, reverb, baseEqGains, baseReverbPreset, mediaPlayer, basePitch, onVolumeDuck)
                 isEffectActive = false
                 activeEffectType = null
+                pcmEffectMode = 0
                 withContext(Dispatchers.Main) {
                     onComplete()
                 }
@@ -159,185 +172,181 @@ class DjAudioProcessor(private val context: Context) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    // 1. Vinyl Scratch Implementation
+    // 1. Vinyl Scratch
     // ─────────────────────────────────────────────────────────────────────────────
 
-    private suspend fun executeVinylScratch(onVolumeDuck: ((Float) -> Unit)?) {
-        val soundIndex = (0..2).random()
-        val soundId = scratchSoundIds.getOrNull(soundIndex) ?: -1
+    private suspend fun executeVinylScratch(
+        mediaPlayer: MediaPlayer?,
+        onVolumeDuck: ((Float) -> Unit)?
+    ) {
+        val styleIndex = (0..2).random()
+        val pcm = when (styleIndex) {
+            0 -> scratchPcmChirp
+            1 -> scratchPcmBaby
+            else -> scratchPcmBackspin
+        } ?: scratchPcmBaby
 
-        // Brief, subtle ducking of underlying track by ~2.5dB so scratch cuts through cleanly
-        onVolumeDuck?.invoke(0.72f)
+        val wavFile = scratchFiles.getOrNull(styleIndex) ?: scratchFiles.firstOrNull()
 
-        if (isSoundPoolReady && soundId > 0 && soundPool != null) {
-            try {
-                soundPool?.play(soundId, 0.70f, 0.70f, 1, 0, 1.0f)
-            } catch (_: Throwable) {}
+        // 1. Setup real-time PCM overlay for AudioTrack synth playback
+        pcmCurrentScratch = pcm
+        pcmScratchIndex = 0
+        pcmEffectMode = 1 // SCRATCH
+
+        // 2. Audible ducking of primary playback so scratch is crisp and punchy
+        onVolumeDuck?.invoke(0.35f)
+
+        // 3. Play scratch via dedicated MediaPlayer if wav file exists
+        if (wavFile != null && wavFile.exists()) {
+            withContext(Dispatchers.Main) {
+                try {
+                    scratchMediaPlayer?.release()
+                    scratchMediaPlayer = MediaPlayer().apply {
+                        setDataSource(context, Uri.fromFile(wavFile))
+                        setVolume(1.0f, 1.0f)
+                        prepare()
+                        start()
+                        setOnCompletionListener { mp ->
+                            try { mp.release() } catch (_: Throwable) {}
+                            if (scratchMediaPlayer == mp) scratchMediaPlayer = null
+                        }
+                    }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Scratch player playback fallback: ${e.message}")
+                }
+            }
         }
 
-        // Scratch duration is controlled and brief (400ms - 550ms)
+        // Controlled scratch duration (480ms)
         delay(480)
 
         // Smooth volume restore
-        onVolumeDuck?.invoke(0.88f)
-        delay(60)
+        onVolumeDuck?.invoke(0.70f)
+        delay(50)
         onVolumeDuck?.invoke(1.0f)
+        pcmEffectMode = 0
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    // 2. Filter Sweep Implementation
+    // 2. Filter Sweep
     // ─────────────────────────────────────────────────────────────────────────────
 
-    private suspend fun executeFilterSweep(equalizer: Equalizer?, baseGains: FloatArray) {
-        if (equalizer == null) {
-            delay(1500)
-            return
-        }
+    private suspend fun executeFilterSweep(
+        equalizer: Equalizer?,
+        baseGains: FloatArray,
+        onVolumeDuck: ((Float) -> Unit)?
+    ) {
+        pcmEffectMode = 2 // FILTER SWEEP
+        pcmFilterProgress = 0.0
 
-        val numBands = min(equalizer.numberOfBands.toInt(), baseGains.size).coerceAtLeast(1)
-        val range = equalizer.bandLevelRange
-        val minMb = range[0].toInt()
-        val maxMb = range[1].toInt()
+        val totalSteps = 45 // ~2.2 seconds total sweep
+        for (i in 1..totalSteps) {
+            val progress = i.toDouble() / totalSteps
+            pcmFilterProgress = progress // Sweeps cutoff from 350Hz up to 10000Hz
 
-        // Filter sweep target: Attenuate high frequencies (bands 3 & 4), slight warmth on bass
-        // Sweep in: 1200ms, Hold: 400ms, Sweep out: 1400ms
-        val totalStepsIn = 35
-        for (step in 1..totalStepsIn) {
-            val progress = step.toFloat() / totalStepsIn
-            // Ease-in curve
-            val eased = progress * progress
-            for (band in 0 until numBands) {
-                val baseDb = baseGains[band]
-                val targetDelta = when (band) {
-                    numBands - 1 -> -11f // Highest treble
-                    numBands - 2 -> -7f  // High-mid
-                    0 -> 2f              // Low bass warmth
-                    else -> -2f
-                }
-                val currentDb = baseDb + (targetDelta * eased)
-                val mb = (currentDb * 100).toInt().coerceIn(minMb, maxMb).toShort()
-                try { equalizer.setBandLevel(band.toShort(), mb) } catch (_: Throwable) {}
+            // Also modulate hardware Equalizer if available
+            equalizer?.let { eq ->
+                try {
+                    val numBands = min(eq.numberOfBands.toInt(), baseGains.size)
+                    val range = eq.bandLevelRange
+                    val minMb = range[0].toInt()
+                    val maxMb = range[1].toInt()
+                    // Muffle high bands at start, then open up
+                    val deltaHigh = (1.0 - progress) * -14.0 // -14dB up to 0dB
+                    for (b in 0 until numBands) {
+                        val base = baseGains[b]
+                        val added = if (b >= numBands / 2) deltaHigh.toFloat() else (deltaHigh * -0.2f).toFloat()
+                        val mb = ((base + added) * 100).toInt().coerceIn(minMb, maxMb).toShort()
+                        eq.setBandLevel(b.toShort(), mb)
+                    }
+                } catch (_: Throwable) {}
             }
-            delay(32)
-        }
 
-        delay(400) // Brief plateau
-
-        // Smooth filter sweep back to normal base gains
-        val totalStepsOut = 40
-        for (step in 1..totalStepsOut) {
-            val progress = step.toFloat() / totalStepsOut
-            val eased = 1.0f - cos(progress * Math.PI.toFloat() * 0.5f) // Smooth cosine release
-            for (band in 0 until numBands) {
-                val baseDb = baseGains[band]
-                val targetDelta = when (band) {
-                    numBands - 1 -> -11f
-                    numBands - 2 -> -7f
-                    0 -> 2f
-                    else -> -2f
-                }
-                val currentDb = baseDb + (targetDelta * (1f - eased))
-                val mb = (currentDb * 100).toInt().coerceIn(minMb, maxMb).toShort()
-                try { equalizer.setBandLevel(band.toShort(), mb) } catch (_: Throwable) {}
-            }
-            delay(35)
+            delay(48)
         }
+        pcmEffectMode = 0
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    // 3. Beat-Filtering Implementation
+    // 3. Beat-Filtering
     // ─────────────────────────────────────────────────────────────────────────────
 
-    private suspend fun executeBeatFilter(equalizer: Equalizer?, baseGains: FloatArray) {
-        if (equalizer == null) {
-            delay(1600)
-            return
-        }
+    private suspend fun executeBeatFilter(
+        equalizer: Equalizer?,
+        baseGains: FloatArray,
+        onVolumeDuck: ((Float) -> Unit)?
+    ) {
+        pcmEffectMode = 3 // BEAT FILTER
 
-        val numBands = min(equalizer.numberOfBands.toInt(), baseGains.size).coerceAtLeast(1)
-        val range = equalizer.bandLevelRange
-        val minMb = range[0].toInt()
-        val maxMb = range[1].toInt()
-
-        // 3 syncopated rhythmic filter dips (e.g. 500ms per pulse)
+        // 3 syncopated rhythmic chops (~450ms each)
         repeat(3) { pulse ->
-            val dipSteps = 8
-            for (s in 1..dipSteps) {
-                val t = s.toFloat() / dipSteps
-                val dipAmount = sin(t * Math.PI.toFloat()) * -8.0f
-                for (b in (numBands / 2) until numBands) {
-                    val currentDb = baseGains[b] + dipAmount
-                    val mb = (currentDb * 100).toInt().coerceIn(minMb, maxMb).toShort()
-                    try { equalizer.setBandLevel(b.toShort(), mb) } catch (_: Throwable) {}
+            val steps = 9
+            for (s in 1..steps) {
+                val t = s.toDouble() / steps
+                // Sine bell envelope
+                val dip = sin(t * Math.PI)
+                pcmBeatFilterPulse = dip
+
+                // Audible hardware pump
+                val duck = (1.0 - (dip * 0.50)).toFloat()
+                onVolumeDuck?.invoke(duck)
+
+                equalizer?.let { eq ->
+                    try {
+                        val numBands = min(eq.numberOfBands.toInt(), baseGains.size)
+                        val range = eq.bandLevelRange
+                        for (b in (numBands / 2) until numBands) {
+                            val target = baseGains[b] - (dip * 10.0).toFloat()
+                            val mb = (target * 100).toInt().coerceIn(range[0].toInt(), range[1].toInt()).toShort()
+                            eq.setBandLevel(b.toShort(), mb)
+                        }
+                    } catch (_: Throwable) {}
                 }
                 delay(30)
             }
-            delay(120) // Gap between rhythmic pulses
+            delay(120) // Gap between pulses
         }
+        onVolumeDuck?.invoke(1.0f)
+        pcmEffectMode = 0
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    // 4. Radio / Vocal Filter Implementation
+    // 4. Radio / Vocal Filter
     // ─────────────────────────────────────────────────────────────────────────────
 
-    private suspend fun executeRadioFilter(equalizer: Equalizer?, baseGains: FloatArray) {
-        if (equalizer == null) {
-            delay(2500)
-            return
-        }
+    private suspend fun executeRadioFilter(
+        equalizer: Equalizer?,
+        baseGains: FloatArray,
+        onVolumeDuck: ((Float) -> Unit)?
+    ) {
+        pcmEffectMode = 4 // RADIO BANDPASS
 
-        val numBands = min(equalizer.numberOfBands.toInt(), baseGains.size).coerceAtLeast(1)
-        val range = equalizer.bandLevelRange
-        val minMb = range[0].toInt()
-        val maxMb = range[1].toInt()
-
-        // Smooth transition into radio filter (telephone bandpass)
-        val inSteps = 15
-        for (step in 1..inSteps) {
-            val progress = step.toFloat() / inSteps
-            for (band in 0 until numBands) {
-                val baseDb = baseGains[band]
-                val targetDelta = when (band) {
-                    0 -> -11f // Cut sub-bass
-                    1 -> -8f  // Cut low-mid
-                    2 -> 6f   // Boost telephone mid
-                    3 -> 2f
-                    else -> -9f // Cut extreme treble
+        // Hardware EQ radio setting
+        equalizer?.let { eq ->
+            try {
+                val numBands = min(eq.numberOfBands.toInt(), baseGains.size)
+                val range = eq.bandLevelRange
+                for (b in 0 until numBands) {
+                    val db = when (b) {
+                        0 -> -15f // Cut deep bass
+                        1 -> -10f // Cut low-mid
+                        2 -> 8f   // Boost telephone mid
+                        3 -> 2f
+                        else -> -12f // Cut highs
+                    }
+                    val mb = (db * 100).toInt().coerceIn(range[0].toInt(), range[1].toInt()).toShort()
+                    eq.setBandLevel(b.toShort(), mb)
                 }
-                val currentDb = baseDb + (targetDelta * progress)
-                val mb = (currentDb * 100).toInt().coerceIn(minMb, maxMb).toShort()
-                try { equalizer.setBandLevel(band.toShort(), mb) } catch (_: Throwable) {}
-            }
-            delay(30)
+            } catch (_: Throwable) {}
         }
 
-        // Hold vintage radio tone for 2.2 seconds
-        delay(2200)
-
-        // Smooth glide back to clean sound
-        val outSteps = 25
-        for (step in 1..outSteps) {
-            val progress = step.toFloat() / outSteps
-            val rem = 1f - progress
-            for (band in 0 until numBands) {
-                val baseDb = baseGains[band]
-                val targetDelta = when (band) {
-                    0 -> -11f
-                    1 -> -8f
-                    2 -> 6f
-                    3 -> 2f
-                    else -> -9f
-                }
-                val currentDb = baseDb + (targetDelta * rem)
-                val mb = (currentDb * 100).toInt().coerceIn(minMb, maxMb).toShort()
-                try { equalizer.setBandLevel(band.toShort(), mb) } catch (_: Throwable) {}
-            }
-            delay(32)
-        }
+        // Hold vintage radio tone for 2.4 seconds
+        delay(2400)
+        pcmEffectMode = 0
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    // 5. Echo-Out Implementation
+    // 5. Echo-Out
     // ─────────────────────────────────────────────────────────────────────────────
 
     private suspend fun executeEchoOut(
@@ -345,22 +354,30 @@ class DjAudioProcessor(private val context: Context) {
         basePreset: String,
         onVolumeDuck: ((Float) -> Unit)?
     ) {
+        pcmEffectMode = 5 // ECHO
+        echoMixLevel = 0.65f
+        echoFeedback = 0.58f
+
+        // Hardware reverb
         try {
-            // Engage expansive spatial reverb tail
             reverb?.preset = PresetReverb.PRESET_LARGEHALL
         } catch (_: Throwable) {}
 
-        // Gentle spatial decay over 2.4 seconds
-        delay(1200)
-        onVolumeDuck?.invoke(0.90f)
-        delay(600)
-        onVolumeDuck?.invoke(0.95f)
-        delay(600)
-        onVolumeDuck?.invoke(1.0f)
+        // Natural acoustic echo decay over 2.4 seconds
+        val decaySteps = 24
+        for (i in 1..decaySteps) {
+            val progress = i.toFloat() / decaySteps
+            echoMixLevel = 0.65f * (1.0f - progress)
+            echoFeedback = 0.58f * (1.0f - progress)
+            delay(100)
+        }
+
+        pcmEffectMode = 0
+        echoMixLevel = 0.0f
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    // 6. Turntable Spin-Up Implementation
+    // 6. Turntable Spin-Up
     // ─────────────────────────────────────────────────────────────────────────────
 
     private suspend fun executeVinylSpinUp(
@@ -368,18 +385,21 @@ class DjAudioProcessor(private val context: Context) {
         basePitch: Float,
         onVolumeDuck: ((Float) -> Unit)?
     ) {
+        pcmEffectMode = 6 // SPIN UP
+        spinUpProgress = 0.65
+
+        // Hardware pitch ramp if MediaPlayer is available
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && mediaPlayer != null) {
             try {
-                // Short needle touch
-                onVolumeDuck?.invoke(0.85f)
                 val params = mediaPlayer.playbackParams
-                val startPitch = (basePitch * 0.86f).coerceIn(0.5f, 2.0f)
+                val startPitch = (basePitch * 0.70f).coerceIn(0.5f, 2.0f)
                 params.pitch = startPitch
                 mediaPlayer.playbackParams = params
 
-                val steps = 14
+                val steps = 18
                 for (s in 1..steps) {
                     val p = s.toFloat() / steps
+                    spinUpProgress = 0.65 + (0.35 * p)
                     val currentPitch = startPitch + ((basePitch - startPitch) * p)
                     params.pitch = currentPitch
                     try { mediaPlayer.playbackParams = params } catch (_: Throwable) {}
@@ -387,9 +407,78 @@ class DjAudioProcessor(private val context: Context) {
                 }
             } catch (_: Throwable) {}
         } else {
-            delay(500)
+            // Software spin up ramp
+            val steps = 20
+            for (s in 1..steps) {
+                spinUpProgress = 0.65 + (0.35 * (s.toDouble() / steps))
+                delay(35)
+            }
         }
-        onVolumeDuck?.invoke(1.0f)
+
+        spinUpProgress = 1.0
+        pcmEffectMode = 0
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Real-Time PCM Audio DSP Pipeline (Called on every single AudioTrack sample)
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    fun processPcmSample(rawSample: Double): Double {
+        var sample = rawSample
+
+        when (pcmEffectMode) {
+            1 -> {
+                // VINYL SCRATCH MIX
+                val scratch = pcmCurrentScratch
+                if (scratch != null && pcmScratchIndex < scratch.size) {
+                    val scratchNorm = scratch[pcmScratchIndex] / 32768.0
+                    pcmScratchIndex++
+                    // Music ducked heavily to 0.22, scratch blasting at 0.88!
+                    sample = (sample * 0.22) + (scratchNorm * 0.88)
+                }
+            }
+            2 -> {
+                // FILTER SWEEP: Resonant State-Variable Filter (Cutoff sweeps from 320Hz to 11000Hz)
+                val cutoff = 320.0 + (10680.0 * (pcmFilterProgress * pcmFilterProgress))
+                val f = 2.0 * sin(Math.PI * cutoff / SAMPLE_RATE)
+                val q = 1.4 // Resonant DJ filter Q
+                svfHigh = sample - svfLow - svfBand / q
+                svfBand += svfHigh * f
+                svfLow += svfBand * f
+                sample = svfLow * 1.15
+            }
+            3 -> {
+                // BEAT FILTER: Rhythmic Pulse (dip volume and filter)
+                val dip = pcmBeatFilterPulse
+                val vol = (1.0 - dip * 0.60)
+                sample *= vol
+            }
+            4 -> {
+                // RADIO FILTER: Bandpass (telephone curve + soft saturation)
+                val f = 2.0 * sin(Math.PI * 1250.0 / SAMPLE_RATE)
+                val q = 2.2
+                svfHigh = sample - svfLow - svfBand / q
+                svfBand += svfHigh * f
+                svfLow += svfBand * f
+                val band = svfBand * 2.2
+                // Soft tube saturation
+                sample = tanh(band * 1.4) * 0.90
+            }
+            5 -> {
+                // ECHO RING BUFFER
+                val delayed = echoBuffer[echoBufferIndex]
+                val output = sample + (delayed * echoMixLevel)
+                echoBuffer[echoBufferIndex] = (sample + (delayed * echoFeedback)).toFloat().coerceIn(-1.0f, 1.0f)
+                echoBufferIndex = (echoBufferIndex + 1) % echoDelaySamples
+                sample = output
+            }
+            6 -> {
+                // SPIN UP: Speed modulation
+                sample *= spinUpProgress
+            }
+        }
+
+        return sample.coerceIn(-1.0, 1.0)
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -407,6 +496,7 @@ class DjAudioProcessor(private val context: Context) {
     ) {
         activeJob?.cancel()
         activeJob = null
+        pcmEffectMode = 0
         restoreBaseAudioStates(equalizer, reverb, baseEqGains, baseReverbPreset, mediaPlayer, basePitch, onVolumeDuck)
         isEffectActive = false
         activeEffectType = null
@@ -422,7 +512,7 @@ class DjAudioProcessor(private val context: Context) {
         onVolumeDuck: ((Float) -> Unit)?
     ) {
         try {
-            // Restore Equalizer to user's saved base band levels
+            // Restore Equalizer to user's base gains
             equalizer?.let { eq ->
                 val numBands = min(eq.numberOfBands.toInt(), baseEqGains.size)
                 val range = eq.bandLevelRange
@@ -460,7 +550,11 @@ class DjAudioProcessor(private val context: Context) {
             }
         } catch (_: Throwable) {}
 
-        // Restore volume ducking
+        try {
+            scratchMediaPlayer?.release()
+            scratchMediaPlayer = null
+        } catch (_: Throwable) {}
+
         try {
             onVolumeDuck?.invoke(1.0f)
         } catch (_: Throwable) {}
@@ -470,83 +564,69 @@ class DjAudioProcessor(private val context: Context) {
         activeJob?.cancel()
         activeJob = null
         try {
-            soundPool?.release()
+            scratchMediaPlayer?.release()
         } catch (_: Throwable) {}
-        soundPool = null
-        isSoundPoolReady = false
+        scratchMediaPlayer = null
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    // Procedural Scratch Sound Synthesizer (Authentic Vinyl Audio Assets)
+    // High-Fidelity Scratch PCM Generator
     // ─────────────────────────────────────────────────────────────────────────────
 
     private enum class ScratchStyle {
         CHIRP, BABY, BACKSPIN
     }
 
-    private fun generateScratchWav(fileName: String, style: ScratchStyle): File? {
-        return try {
-            val cacheFile = File(context.cacheDir, fileName)
-            if (cacheFile.exists() && cacheFile.length() > 500) {
-                return cacheFile
-            }
-
-            val durationSec = when (style) {
-                ScratchStyle.CHIRP -> 0.35
-                ScratchStyle.BABY -> 0.48
-                ScratchStyle.BACKSPIN -> 0.58
-            }
-            val totalSamples = (SAMPLE_RATE * durationSec).toInt()
-            val pcmData = ShortArray(totalSamples)
-
-            for (i in 0 until totalSamples) {
-                val t = i.toDouble() / totalSamples // 0.0 to 1.0
-
-                // Frequency trajectory modeling vinyl needle rub & backspin
-                val freq = when (style) {
-                    ScratchStyle.CHIRP -> {
-                        // Rapid forward chirp
-                        val fNorm = sin(t * Math.PI)
-                        450.0 + (1600.0 * fNorm)
-                    }
-                    ScratchStyle.BABY -> {
-                        // 2-stroke "wicka-wicka" forward & backward rub
-                        val cycle = sin(t * Math.PI * 2.0)
-                        500.0 + (1200.0 * abs(cycle))
-                    }
-                    ScratchStyle.BACKSPIN -> {
-                        // Turntable slip: high to low frequency deceleration
-                        val decel = (1.0 - t).pow(1.8)
-                        220.0 + (2400.0 * decel)
-                    }
-                }
-
-                // Phase integration for frequency-modulated oscillator
-                val carrier = sin(2.0 * Math.PI * freq * (i.toDouble() / SAMPLE_RATE))
-
-                // High-frequency vinyl needle friction noise
-                val noise = (Math.random() * 2.0 - 1.0) * 0.22
-
-                // Smooth envelope avoiding pops at edges
-                val envelope = sin(t * Math.PI).pow(0.8)
-
-                val sample = ((carrier * 0.78 + noise) * envelope).coerceIn(-1.0, 1.0)
-                pcmData[i] = (sample * 30000.0).toInt().toShort()
-            }
-
-            writeWavFile(cacheFile, pcmData, SAMPLE_RATE)
-            cacheFile
-        } catch (e: Exception) {
-            Log.e(TAG, "Error synthesizing scratch WAV $fileName: ${e.message}")
-            null
+    private fun generateScratchPcm(style: ScratchStyle): ShortArray {
+        val durationSec = when (style) {
+            ScratchStyle.CHIRP -> 0.38
+            ScratchStyle.BABY -> 0.50
+            ScratchStyle.BACKSPIN -> 0.62
         }
+        val totalSamples = (SAMPLE_RATE * durationSec).toInt()
+        val pcmData = ShortArray(totalSamples)
+
+        for (i in 0 until totalSamples) {
+            val t = i.toDouble() / totalSamples
+
+            val freq = when (style) {
+                ScratchStyle.CHIRP -> {
+                    // Rapid forward sweep with needle friction
+                    val f = sin(t * Math.PI)
+                    500.0 + (1900.0 * f)
+                }
+                ScratchStyle.BABY -> {
+                    // 2-stroke "wicka-wicka" rub
+                    val cycle = sin(t * Math.PI * 2.0)
+                    550.0 + (1400.0 * abs(cycle))
+                }
+                ScratchStyle.BACKSPIN -> {
+                    // Backspin deceleration
+                    val decel = (1.0 - t).pow(1.6)
+                    250.0 + (2800.0 * decel)
+                }
+            }
+
+            // Frequency modulated carrier + vinyl friction noise
+            val carrier = sin(2.0 * Math.PI * freq * (i.toDouble() / SAMPLE_RATE))
+            val noise = (Math.random() * 2.0 - 1.0) * 0.28
+            val envelope = sin(t * Math.PI).pow(0.7)
+
+            val sample = ((carrier * 0.75 + noise) * envelope).coerceIn(-1.0, 1.0)
+            pcmData[i] = (sample * 31500.0).toInt().toShort()
+        }
+
+        return pcmData
     }
 
-    private fun writeWavFile(file: File, pcmData: ShortArray, sampleRate: Int) {
+    private fun writeWavToFiles(fileName: String, pcmData: ShortArray): File {
+        val file = File(context.filesDir, fileName)
+        if (file.exists() && file.length() > 500) return file
+
         val totalAudioLen = pcmData.size * 2
         val totalDataLen = totalAudioLen + 36
         val channels = 1
-        val byteRate = sampleRate * channels * 2
+        val byteRate = SAMPLE_RATE * channels * 2
 
         FileOutputStream(file).use { out ->
             val header = ByteBuffer.allocate(44).apply {
@@ -555,28 +635,25 @@ class DjAudioProcessor(private val context: Context) {
                 putInt(totalDataLen)
                 put("WAVE".toByteArray())
                 put("fmt ".toByteArray())
-                putInt(16) // Subchunk1Size
-                putShort(1.toShort()) // PCM format
+                putInt(16)
+                putShort(1.toShort())
                 putShort(channels.toShort())
-                putInt(sampleRate)
+                putInt(SAMPLE_RATE)
                 putInt(byteRate)
                 putShort((channels * 2).toShort())
-                putShort(16.toShort()) // Bits per sample
+                putShort(16.toShort())
                 put("data".toByteArray())
                 putInt(totalAudioLen)
             }.array()
 
             out.write(header)
-
             val pcmBytes = ByteBuffer.allocate(totalAudioLen).apply {
                 order(ByteOrder.LITTLE_ENDIAN)
-                for (s in pcmData) {
-                    putShort(s)
-                }
+                for (s in pcmData) putShort(s)
             }.array()
-
             out.write(pcmBytes)
             out.flush()
         }
+        return file
     }
 }

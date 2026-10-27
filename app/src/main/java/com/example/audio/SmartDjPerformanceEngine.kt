@@ -15,12 +15,12 @@ import kotlin.random.Random
  * Smart Random DJ Performance Engine.
  * 
  * An intelligent, state-aware scheduler that dynamically decides:
- * 1. Whether an effect should happen (~25–35% initial target frequency for eligible songs).
- * 2. Which effect is musically suitable (Intro reveal, mid-track filter/break, or outro scratch/echo-out).
- * 3. Exact musical placement and timing while strictly respecting existing crossfade boundaries.
- * 4. Playlist replay variation: Uses lightweight history to favor different outcomes when replaying
+ * 1. Which effect is musically suitable (Intro reveal, mid-track filter/break, or outro scratch/echo-out).
+ * 2. Exact musical placement and timing while strictly respecting existing crossfade boundaries.
+ * 3. Playlist replay variation: Uses lightweight history to favor different outcomes when replaying
  *    the same playlist, avoiding repetitive effect sequences or consecutive song repetitions.
- * 5. Safe isolation: Never interferes with or resets the existing crossfade or track playback position.
+ * 4. Safe isolation: Never interferes with or resets the existing crossfade or track playback position.
+ * 5. Direct manual pad triggering: Allows instant auditioning of any effect on demand.
  */
 class SmartDjPerformanceEngine(
     private val context: Context,
@@ -30,7 +30,7 @@ class SmartDjPerformanceEngine(
 
     companion object {
         private const val TAG = "SmartDjEngine"
-        private const val MIN_TRACK_DURATION_FOR_EFFECTS_SEC = 25
+        private const val MIN_TRACK_DURATION_FOR_EFFECTS_SEC = 15
     }
 
     data class ScheduledDjMoment(
@@ -50,11 +50,12 @@ class SmartDjPerformanceEngine(
     private var currentScheduledTrackId: Int? = null
     private var pendingMoment: ScheduledDjMoment? = null
     private var lastHandledPositionSec = -1
+    private var trackDurationSec = 180
+    private var activeCrossfadeSec = 20
+    private var activeCrossfadeEnabled = true
 
     /**
      * Called whenever a new track begins or is loaded.
-     * Evaluates whether this track is eligible for an effect, and if so, schedules
-     * a tailored, randomized effect moment considering past replay history.
      */
     @Synchronized
     fun onTrackStarted(
@@ -63,10 +64,12 @@ class SmartDjPerformanceEngine(
         crossfadeSec: Int,
         isCrossfadeEnabled: Boolean
     ) {
-        // Cancel any active effect cleanly when track changes
         cancelCurrentPerformance()
 
         currentScheduledTrackId = track.id
+        trackDurationSec = track.durationSec.coerceAtLeast(30)
+        activeCrossfadeSec = crossfadeSec
+        activeCrossfadeEnabled = isCrossfadeEnabled
         lastHandledPositionSec = -1
 
         if (!isDjEffectsEnabled) {
@@ -74,47 +77,41 @@ class SmartDjPerformanceEngine(
             return
         }
 
-        val durationSec = track.durationSec
-        if (durationSec < MIN_TRACK_DURATION_FOR_EFFECTS_SEC) {
-            // Very short track: deliberately leave clean
-            history.recordCleanPlay(track.id)
+        // Schedule first effect for this track (e.g. Intro reveal or early drop within seconds 3-7)
+        scheduleNextMoment(currentSec = 0)
+    }
+
+    private fun scheduleNextMoment(currentSec: Int) {
+        val durationSec = trackDurationSec
+        val effectiveCfSec = if (activeCrossfadeEnabled) activeCrossfadeSec.coerceAtLeast(0) else 0
+        val crossfadeStartSec = durationSec - effectiveCfSec
+
+        // Avoid scheduling inside or past the crossfade window
+        if (currentSec >= crossfadeStartSec - 8) {
             pendingMoment = null
             return
         }
 
-        // 1. Evaluate effect eligibility:
-        // Target: ~25-35% of eligible songs receive an effect.
-        // Check replay history to create variation between playlist playthroughs:
-        val hadEffectLastTime = history.hadEffectLastPlay(track.id)
-        val selectionProbability = if (hadEffectLastTime) {
-            // Favor clean play on this playthrough if it had an effect last time (~12%)
-            0.12f
-        } else {
-            // Favor an effect if it was clean last playthrough (~36%)
-            0.36f
-        }
-
-        val shouldPerform = Random.nextFloat() < selectionProbability
-        if (!shouldPerform) {
-            // Deliberately untouched for natural listening experience
-            history.recordCleanPlay(track.id)
-            pendingMoment = null
-            return
-        }
-
-        // 2. Select appropriate effect based on history and section
-        val lastEffectForThisTrack = history.getLastEffectForTrack(track.id)
+        val lastEffectForThisTrack = currentScheduledTrackId?.let { history.getLastEffectForTrack(it) }
         val lastGlobalEffect = history.getLastGlobalEffect()
 
-        // Choose candidate section:
-        // - INTRO (0-4s): ~30% chance
-        // - MID_SONG (35-55% duration): ~40% chance
-        // - OUTRO (before crossfade): ~30% chance
-        val sectionRoll = Random.nextFloat()
-        val section = when {
-            sectionRoll < 0.30f -> DjSection.INTRO
-            sectionRoll < 0.70f -> DjSection.MID_SONG
-            else -> DjSection.TRANSITION_OR_BREAK
+        val (section, triggerSec) = when {
+            currentSec < 10 -> {
+                // Intro moment: between 3s and 7s
+                val introSec = Random.nextInt(3, 7.coerceAtMost(durationSec / 3).coerceAtLeast(4))
+                DjSection.INTRO to introSec
+            }
+            currentSec < crossfadeStartSec - 25 -> {
+                // Mid-track moment: 20-35s ahead of current position
+                val nextSec = currentSec + Random.nextInt(20, 35)
+                val clamped = nextSec.coerceAtMost(crossfadeStartSec - 12)
+                DjSection.MID_SONG to clamped
+            }
+            else -> {
+                // Outro / transition moment: 6s before crossfade starts
+                val outroSec = (crossfadeStartSec - 6).coerceAtLeast(currentSec + 2)
+                DjSection.TRANSITION_OR_BREAK to outroSec
+            }
         }
 
         val candidateEffects = DjEffectType.entries.filter { effect ->
@@ -124,46 +121,16 @@ class SmartDjPerformanceEngine(
                 DjSection.TRANSITION_OR_BREAK -> effect.preferredSection == DjSection.TRANSITION_OR_BREAK
                 else -> true
             }
-            // Avoid repeating the exact effect used on the immediately preceding song
+            // Avoid repeating the exact effect used immediately prior
             val notConsecutive = (effect != lastGlobalEffect)
-            // Avoid repeating the effect used on this specific track last time
-            val notSameAsLastPlay = (effect != lastEffectForThisTrack)
-            matchesSection && notConsecutive && notSameAsLastPlay
+            matchesSection && notConsecutive
         }.ifEmpty {
-            // Fallback: any effect matching section that is not consecutive
             DjEffectType.entries.filter { it != lastGlobalEffect }
         }.ifEmpty {
             DjEffectType.entries.toList()
         }
 
         val chosenEffect = candidateEffects.random()
-
-        // 3. Compute safe trigger position based on section and existing crossfade boundaries
-        val effectiveCrossfadeSec = if (isCrossfadeEnabled) crossfadeSec.coerceAtLeast(0) else 0
-
-        val triggerSec = when (section) {
-            DjSection.INTRO -> {
-                // Intro: between second 1 and 3
-                val maxIntro = 3.coerceAtMost(durationSec / 4).coerceAtLeast(2)
-                Random.nextInt(1, maxIntro)
-            }
-            DjSection.MID_SONG, DjSection.INTRO_OR_MID -> {
-                // Mid: stable middle portion (35% - 55% of track duration)
-                val minMid = (durationSec * 0.35f).toInt()
-                val maxMid = (durationSec * 0.55f).toInt().coerceAtLeast(minMid + 1)
-                Random.nextInt(minMid, maxMid)
-            }
-            DjSection.TRANSITION_OR_BREAK -> {
-                // Outro / Transition:
-                // MUST trigger and complete BEFORE the crossfade starts so they never compete!
-                // If crossfade is 20s, crossfade begins at (durationSec - 20).
-                // We schedule outro effect at (durationSec - 20 - 5) seconds.
-                val bufferBeforeCrossfade = 5
-                val outroStart = (durationSec - effectiveCrossfadeSec - bufferBeforeCrossfade)
-                    .coerceIn(durationSec / 2, (durationSec - effectiveCrossfadeSec - 2).coerceAtLeast(durationSec / 2))
-                outroStart
-            }
-        }
 
         pendingMoment = ScheduledDjMoment(
             effectType = chosenEffect,
@@ -174,7 +141,6 @@ class SmartDjPerformanceEngine(
 
     /**
      * Called on each playback progress loop tick (e.g. ~35ms) by MusicPlaybackManager.
-     * Evaluates if conditions are safe and timing is reached to trigger the scheduled moment.
      */
     @Synchronized
     fun onPlaybackTick(
@@ -206,24 +172,24 @@ class SmartDjPerformanceEngine(
             return
         }
 
-        // If track changed, reset
         if (currentScheduledTrackId != track.id) {
-            return
+            currentScheduledTrackId = track.id
+            trackDurationSec = track.durationSec.coerceAtLeast(30)
+            scheduleNextMoment(currentPosSec)
         }
 
-        // Seeking detection: If position jumped backward or jumped ahead past the window
         val moment = pendingMoment ?: return
         if (moment.hasTriggered || processor.isEffectActive) {
             return
         }
 
-        // Trigger when reached scheduled position
-        if (isPlaying && currentPosSec >= moment.triggerPositionSec && currentPosSec <= moment.triggerPositionSec + 3) {
+        // Trigger when reached or passed scheduled position
+        if (isPlaying && currentPosSec >= moment.triggerPositionSec && currentPosSec <= moment.triggerPositionSec + 5) {
             moment.hasTriggered = true
             _isDjEffectExecuting.value = true
             _lastTriggeredEffectName.value = moment.effectType.displayName
 
-            // Record in history for future replay variety
+            // Record in history for replay variation
             history.recordEffect(track.id, moment.effectType)
 
             processor.triggerEffect(
@@ -237,11 +203,46 @@ class SmartDjPerformanceEngine(
                 onVolumeDuck = onVolumeDuck,
                 onComplete = {
                     _isDjEffectExecuting.value = false
+                    // Schedule next moment in this song if time permits
+                    scheduleNextMoment(currentPosSec + 4)
                 }
             )
         }
 
         lastHandledPositionSec = currentPosSec
+    }
+
+    /**
+     * Direct manual trigger from UI pads (e.g. tapping "Scratch" or "Filter Sweep").
+     */
+    @Synchronized
+    fun triggerManualEffect(
+        effect: DjEffectType,
+        mediaPlayer: MediaPlayer?,
+        equalizer: Equalizer?,
+        reverb: PresetReverb?,
+        baseEqGains: FloatArray,
+        baseReverbPreset: String,
+        basePitch: Float,
+        onVolumeDuck: ((Float) -> Unit)? = null
+    ) {
+        _isDjEffectExecuting.value = true
+        _lastTriggeredEffectName.value = effect.displayName
+        currentScheduledTrackId?.let { history.recordEffect(it, effect) }
+
+        processor.triggerEffect(
+            effect = effect,
+            mediaPlayer = mediaPlayer,
+            equalizer = equalizer,
+            reverb = reverb,
+            baseEqGains = baseEqGains,
+            baseReverbPreset = baseReverbPreset,
+            basePitch = basePitch,
+            onVolumeDuck = onVolumeDuck,
+            onComplete = {
+                _isDjEffectExecuting.value = false
+            }
+        )
     }
 
     /**
@@ -263,18 +264,10 @@ class SmartDjPerformanceEngine(
         _isDjEffectExecuting.value = false
     }
 
-    /**
-     * Called when the user seeks: if seeking past the scheduled moment, mark as skipped.
-     */
     @Synchronized
     fun onSeek(targetProgress: Float, durationSec: Int) {
         val targetSec = (targetProgress * durationSec).toInt()
-        pendingMoment?.let { moment ->
-            if (targetSec > moment.triggerPositionSec + 3) {
-                // Seeked past the effect window: skip it rather than glitching
-                moment.hasTriggered = true
-            }
-        }
+        scheduleNextMoment(targetSec)
     }
 
     fun release() {

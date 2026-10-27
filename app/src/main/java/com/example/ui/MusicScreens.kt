@@ -57,6 +57,7 @@ import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
 import com.example.R
 import com.example.audio.DjCurveType
+import com.example.audio.DjEffectType
 import com.example.audio.RepeatMode
 import com.example.data.MusicTrack
 import com.example.data.PlaybackQueue
@@ -126,62 +127,69 @@ fun LanguageSelectionDialog(
 
                 Spacer(modifier = Modifier.height(18.dp))
 
-                AppLanguage.entries.forEach { lang ->
-                    val isSelected = lang == currentLanguage
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 4.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .clickable {
-                                onLanguageSelected(lang)
-                                onDismiss()
-                            },
-                        color = if (isSelected) TealPrimary.copy(alpha = 0.18f) else SpacePlayerBg,
-                        border = if (isSelected) BorderStroke(1.5.dp, TealPrimary) else null,
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Row(
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 380.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    AppLanguage.entries.forEach { lang ->
+                        val isSelected = lang == currentLanguage
+                        Surface(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
+                                .padding(vertical = 4.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable {
+                                    onLanguageSelected(lang)
+                                    onDismiss()
+                                },
+                            color = if (isSelected) TealPrimary.copy(alpha = 0.18f) else SpacePlayerBg,
+                            border = if (isSelected) BorderStroke(1.5.dp, TealPrimary) else null,
+                            shape = RoundedCornerShape(12.dp)
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = lang.flag,
-                                    fontSize = 22.sp
-                                )
-                                Spacer(modifier = Modifier.width(12.dp))
-                                Column {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
                                     Text(
-                                        text = lang.nativeName,
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                        color = if (isSelected) TealPrimary else TextLight
+                                        text = lang.flag,
+                                        fontSize = 22.sp
                                     )
-                                    Text(
-                                        text = lang.displayName,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = TextMuted
-                                    )
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column {
+                                        Text(
+                                            text = lang.nativeName,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (isSelected) TealPrimary else TextLight
+                                        )
+                                        Text(
+                                            text = lang.displayName,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = TextMuted
+                                        )
+                                    }
                                 }
-                            }
-                            if (isSelected) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(24.dp)
-                                        .clip(CircleShape)
-                                        .background(TealPrimary),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Check,
-                                        contentDescription = "Selected",
-                                        tint = OnTeal,
-                                        modifier = Modifier.size(16.dp)
-                                    )
+                                if (isSelected) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(24.dp)
+                                            .clip(CircleShape)
+                                            .background(TealPrimary),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Check,
+                                            contentDescription = "Selected",
+                                            tint = OnTeal,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -361,6 +369,7 @@ fun MusicMainScreen(viewModel: MusicViewModel, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val strings = LocalAppStrings.current
+    val currentLanguage = LocalAppLanguage.current
     val currentTab by viewModel.currentTab.collectAsState()
     val tracks by viewModel.allTracks.collectAsState()
     val playlists by viewModel.allPlaylists.collectAsState()
@@ -456,17 +465,34 @@ fun MusicMainScreen(viewModel: MusicViewModel, modifier: Modifier = Modifier) {
                     }
 
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        // Language switching icon IMMEDIATELY BEFORE the refresh icon!
-                        IconButton(
+                        // Language switching flag & label button
+                        Surface(
                             onClick = { showLanguageDialog = true },
-                            modifier = Modifier.testTag("language_switch_button")
+                            modifier = Modifier
+                                .testTag("language_switch_button")
+                                .height(34.dp),
+                            shape = RoundedCornerShape(17.dp),
+                            color = MaterialTheme.colorScheme.surface,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
                         ) {
-                            Icon(
-                                imageVector = Icons.Filled.Language,
-                                contentDescription = strings.switchLanguage,
-                                tint = MaterialTheme.colorScheme.primary
-                            )
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = currentLanguage.flag,
+                                    fontSize = 16.sp
+                                )
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text(
+                                    text = currentLanguage.nativeName,
+                                    style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.SemiBold),
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
                         }
+
+                        Spacer(modifier = Modifier.width(4.dp))
 
                         // Refresh / Media Scan icon
                         IconButton(
@@ -2667,6 +2693,15 @@ fun FullPlayerSheet(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
+                // Live DJ Effect Performance Pads (Instant Audition)
+                if (djEffectsEnabled) {
+                    DjEffectPads(
+                        viewModel = viewModel,
+                        isCompact = true,
+                        modifier = Modifier.padding(bottom = 10.dp)
+                    )
+                }
+
                 // Seek bar & Timers
                 Column {
                     Slider(
@@ -2752,55 +2787,140 @@ fun FullPlayerSheet(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(24.dp))
+                Spacer(modifier = Modifier.height(20.dp))
 
-                // Speed / Pitch tuning slider card
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = SpaceCardBg)
+                // Single consolidated button that defines Tempo speed & Acoustic pitch, showing them when clicked
+                var showTempoPitchPanel by remember { mutableStateOf(false) }
+
+                OutlinedButton(
+                    onClick = { showTempoPitchPanel = !showTempoPitchPanel },
+                    modifier = Modifier.testTag("tempo_pitch_toggle_button"),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = if (showTempoPitchPanel || speedFactor != 1.0f || pitchFactor != 1.0f) TealPrimary.copy(alpha = 0.15f) else SpaceCardBg,
+                        contentColor = if (showTempoPitchPanel || speedFactor != 1.0f || pitchFactor != 1.0f) TealPrimary else TextLight
+                    ),
+                    border = BorderStroke(1.dp, if (showTempoPitchPanel || speedFactor != 1.0f || pitchFactor != 1.0f) TealPrimary else TextMuted.copy(alpha = 0.4f))
                 ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.Filled.Speed, "speed", tint = TealPrimary, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Tempo Speed Tuning", style = MaterialTheme.typography.bodyMedium, color = TextLight, fontWeight = FontWeight.Bold)
+                    Icon(
+                        imageVector = Icons.Filled.Tune,
+                        contentDescription = "Tempo and Pitch",
+                        modifier = Modifier.size(18.dp),
+                        tint = if (showTempoPitchPanel || speedFactor != 1.0f || pitchFactor != 1.0f) TealPrimary else TextLight
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (speedFactor != 1.0f || pitchFactor != 1.0f)
+                            "${strings.speedAndPitch} (${String.format("%.2fx", speedFactor)} / ${String.format("%.2fx", pitchFactor)})"
+                        else
+                            strings.speedAndPitch,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Icon(
+                        imageVector = if (showTempoPitchPanel) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                        tint = if (showTempoPitchPanel || speedFactor != 1.0f || pitchFactor != 1.0f) TealPrimary else TextMuted
+                    )
+                }
+
+                AnimatedVisibility(visible = showTempoPitchPanel) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 12.dp),
+                        colors = CardDefaults.cardColors(containerColor = SpaceCardBg),
+                        shape = RoundedCornerShape(16.dp),
+                        border = BorderStroke(1.dp, TealPrimary.copy(alpha = 0.3f))
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Filled.Speed, "speed", tint = TealPrimary, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "${strings.playbackSpeed} (Tempo)",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = TextLight,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                Text(
+                                    text = String.format("%.2fx", speedFactor),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TealPrimary,
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
-                            Text(text = String.format("%.2fx", speedFactor), style = MaterialTheme.typography.bodySmall, color = TealPrimary)
-                        }
-                        Slider(
-                            value = speedFactor,
-                            onValueChange = { viewModel.playbackManager.setSpeed(it) },
-                            valueRange = 0.25f..3.0f,
-                            colors = SliderDefaults.colors(
-                                thumbColor = TealPrimary,
-                                activeTrackColor = TealPrimary,
-                                inactiveTrackColor = SpaceDarkBg
+                            Slider(
+                                value = speedFactor,
+                                onValueChange = { viewModel.playbackManager.setSpeed(it) },
+                                valueRange = 0.25f..3.0f,
+                                colors = SliderDefaults.colors(
+                                    thumbColor = TealPrimary,
+                                    activeTrackColor = TealPrimary,
+                                    inactiveTrackColor = SpaceDarkBg
+                                )
                             )
-                        )
 
-                        Spacer(modifier = Modifier.height(12.dp))
+                            Spacer(modifier = Modifier.height(12.dp))
 
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text("Acoustic Pitch Tuning", style = MaterialTheme.typography.bodyMedium, color = TextLight, fontWeight = FontWeight.Bold)
-                            Text(text = String.format("%.2fx", pitchFactor), style = MaterialTheme.typography.bodySmall, color = TealPrimary)
-                        }
-                        Slider(
-                            value = pitchFactor,
-                            onValueChange = { viewModel.playbackManager.setPitch(it) },
-                            valueRange = 0.5f..2.0f,
-                            colors = SliderDefaults.colors(
-                                thumbColor = TealPrimary,
-                                activeTrackColor = TealPrimary,
-                                inactiveTrackColor = SpaceDarkBg
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Filled.GraphicEq, "pitch", tint = TealPrimary, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "${strings.pitch} (Acoustic Pitch)",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = TextLight,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                Text(
+                                    text = String.format("%.2fx", pitchFactor),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TealPrimary,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            Slider(
+                                value = pitchFactor,
+                                onValueChange = { viewModel.playbackManager.setPitch(it) },
+                                valueRange = 0.5f..2.0f,
+                                colors = SliderDefaults.colors(
+                                    thumbColor = TealPrimary,
+                                    activeTrackColor = TealPrimary,
+                                    inactiveTrackColor = SpaceDarkBg
+                                )
                             )
-                        )
+
+                            if (speedFactor != 1.0f || pitchFactor != 1.0f) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.End
+                                ) {
+                                    TextButton(
+                                        onClick = {
+                                            viewModel.playbackManager.setSpeed(1.0f)
+                                            viewModel.playbackManager.setPitch(1.0f)
+                                        }
+                                    ) {
+                                        Text("Reset (1.0x)", color = TealPrimary, style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -3151,6 +3271,160 @@ fun PlaylistDetailDialog(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Interactive DJ Effect Performance Pads (Live Audition & Testing)
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+fun DjEffectPads(
+    viewModel: MusicViewModel,
+    modifier: Modifier = Modifier,
+    isCompact: Boolean = false
+) {
+    val isPlaying by viewModel.playbackManager.isPlaying.collectAsState()
+    val isDjEffectExecuting by viewModel.playbackManager.isDjEffectExecuting.collectAsState()
+    val activeDjEffectName by viewModel.playbackManager.activeDjEffectName.collectAsState()
+
+    val effects = listOf(
+        Triple(DjEffectType.VINYL_SCRATCH, "Scratch", Icons.Filled.Refresh),
+        Triple(DjEffectType.FILTER_SWEEP, "Filter Sweep", Icons.Filled.Tune),
+        Triple(DjEffectType.BEAT_FILTER, "Beat Filter", Icons.Filled.Speed),
+        Triple(DjEffectType.RADIO_FILTER, "Radio Filter", Icons.Filled.Info),
+        Triple(DjEffectType.ECHO_OUT, "Echo & Decay", Icons.Filled.AutoAwesome),
+        Triple(DjEffectType.VINYL_SPIN_UP, "Spin-Up", Icons.Filled.PlayArrow)
+    )
+
+    Column(modifier = modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Live DJ FX Pads",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextLight,
+                fontWeight = FontWeight.Bold
+            )
+            if (isDjEffectExecuting && activeDjEffectName != null) {
+                Surface(
+                    shape = RoundedCornerShape(4.dp),
+                    color = AmberAccent,
+                    modifier = Modifier.padding(start = 6.dp)
+                ) {
+                    Text(
+                        text = "LIVE: $activeDjEffectName",
+                        style = TextStyle(fontSize = 9.sp, fontWeight = FontWeight.Bold),
+                        color = SpaceDarkBg,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+            } else {
+                Text(
+                    text = "Tap any pad to hear live",
+                    style = TextStyle(fontSize = 10.sp, color = TextMuted)
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        if (isCompact) {
+            // Horizontal scrollable strip for Now Playing screen
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                effects.forEach { (effect, label, icon) ->
+                    val isActive = isDjEffectExecuting && activeDjEffectName == effect.displayName
+                    Surface(
+                        onClick = {
+                            if (!isPlaying) {
+                                viewModel.playbackManager.togglePlayPause()
+                            }
+                            viewModel.playbackManager.triggerManualDjEffect(effect)
+                        },
+                        modifier = Modifier.testTag("dj_pad_${effect.name.lowercase()}"),
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (isActive) TealPrimary else SpaceCardBg,
+                        border = BorderStroke(1.dp, if (isActive) AmberAccent else TealPrimary.copy(alpha = 0.35f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = icon,
+                                contentDescription = label,
+                                tint = if (isActive) OnTeal else TealPrimary,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = label,
+                                style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold),
+                                color = if (isActive) OnTeal else TextLight
+                            )
+                        }
+                    }
+                }
+            }
+        } else {
+            // 2 rows of 3 buttons for Settings Dialog / Cards
+            val chunked = effects.chunked(3)
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                chunked.forEach { rowEffects ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        rowEffects.forEach { (effect, label, icon) ->
+                            val isActive = isDjEffectExecuting && activeDjEffectName == effect.displayName
+                            Surface(
+                                onClick = {
+                                    if (!isPlaying) {
+                                        viewModel.playbackManager.togglePlayPause()
+                                    }
+                                    viewModel.playbackManager.triggerManualDjEffect(effect)
+                                },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("dj_pad_${effect.name.lowercase()}"),
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (isActive) TealPrimary else SpaceCardBg,
+                                border = BorderStroke(1.dp, if (isActive) AmberAccent else TealPrimary.copy(alpha = 0.35f))
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(vertical = 10.dp, horizontal = 4.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Icon(
+                                        imageVector = icon,
+                                        contentDescription = label,
+                                        tint = if (isActive) OnTeal else TealPrimary,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = label,
+                                        style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold),
+                                        color = if (isActive) OnTeal else TextLight,
+                                        textAlign = TextAlign.Center,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Professional DJ Crossfade Components
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3244,6 +3518,11 @@ fun DjCrossfadeSettingsSection(
                     checkedTrackColor = TealPrimary
                 )
             )
+        }
+
+        if (djEffectsEnabled) {
+            Spacer(modifier = Modifier.height(12.dp))
+            DjEffectPads(viewModel = viewModel, isCompact = false)
         }
 
         Spacer(modifier = Modifier.height(12.dp))

@@ -891,6 +891,22 @@ class MusicPlaybackManager {
         }
     }
 
+    fun triggerManualDjEffect(effect: DjEffectType) {
+        if (!_djEffectsEnabled.value) {
+            setDjEffectsEnabled(true)
+        }
+        djPerformanceEngine?.triggerManualEffect(
+            effect = effect,
+            mediaPlayer = mediaPlayer,
+            equalizer = equalizerFx,
+            reverb = presetReverbFx,
+            baseEqGains = _eqGains.value,
+            baseReverbPreset = _reverbPreset.value,
+            basePitch = _pitch.value,
+            onVolumeDuck = { duck -> applyDuckedVolume(duck) }
+        )
+    }
+
     fun setDjModeEnabled(enabled: Boolean) {
         setDjEffectsEnabled(enabled)
     }
@@ -1237,6 +1253,11 @@ class MusicPlaybackManager {
                             if (synthIncomingPhase > SAMPLE_RATE * 1000) synthIncomingPhase = 0.0
                         }
 
+                        // Apply real-time software DSP DJ effects directly onto AudioTrack PCM stream
+                        if (_djEffectsEnabled.value) {
+                            sample = djAudioProcessor?.processPcmSample(sample) ?: sample
+                        }
+
                         sample = sample.coerceIn(-1.0, 1.0)
                         buffer[i] = (sample * 32767.0).toInt().toShort()
 
@@ -1278,6 +1299,26 @@ class MusicPlaybackManager {
                         } else {
                             _playbackProgress.value = newProgress
                             _currentPositionSec.value = (newProgress * track.durationSec).toInt()
+
+                            // Dispatch playback telemetry to Smart DJ Engine during AudioTrack synthesis
+                            if (!_isCrossfading.value) {
+                                djPerformanceEngine?.onPlaybackTick(
+                                    track = track,
+                                    currentPosSec = _currentPositionSec.value,
+                                    isPlaying = _isPlaying.value,
+                                    isCrossfading = _isCrossfading.value,
+                                    isDjEffectsEnabled = _djEffectsEnabled.value,
+                                    mediaPlayer = null,
+                                    equalizer = equalizerFx,
+                                    reverb = presetReverbFx,
+                                    baseEqGains = _eqGains.value,
+                                    baseReverbPreset = _reverbPreset.value,
+                                    basePitch = _pitch.value,
+                                    onVolumeDuck = { duckFactor ->
+                                        applyDuckedVolume(duckFactor)
+                                    }
+                                )
+                            }
                         }
                     }
                 } else {
