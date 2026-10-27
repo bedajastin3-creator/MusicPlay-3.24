@@ -1,0 +1,106 @@
+name: Build & Sign AAB and APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare Signing Keystores
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Decoding Keystore from GitHub Secret..."
+            echo "$KEYSTORE_BASE64" | base64 --decode > my-upload-key.jks
+          elif [ -f "my-upload-key.jks" ]; then
+            echo "Keystore my-upload-key.jks already exists, checking alias..."
+            if keytool -list -keystore my-upload-key.jks -storepass "52775277Tanzania" -alias "upload" >/dev/null 2>&1; then
+              echo "Keystore verified with alias 'upload'."
+            else
+              echo "Alias 'upload' missing or invalid, regenerating my-upload-key.jks..."
+              rm -f my-upload-key.jks
+              keytool -genkeypair -v \
+                -keystore my-upload-key.jks \
+                -alias "upload" \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -storepass "52775277Tanzania" \
+                -keypass "52775277Tanzania" \
+                -dname "CN=Music Player, OU=Android, O=co.musicplay.ap, L=Dar es Salaam, ST=Dar es Salaam, C=TZ"
+            fi
+          else
+            echo "Generating Keystore with alias 'upload'..."
+            keytool -genkeypair -v \
+              -keystore my-upload-key.jks \
+              -alias "upload" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "52775277Tanzania" \
+              -keypass "52775277Tanzania" \
+              -dname "CN=Music Player, OU=Android, O=co.musicplay.ap, L=Dar es Salaam, ST=Dar es Salaam, C=TZ"
+          fi
+
+          if [ ! -f "debug.keystore" ]; then
+            echo "Generating debug.keystore for debug builds..."
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -alias "androiddebugkey" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "android" \
+              -keypass "android" \
+              -dname "CN=Android Debug, O=Android, C=US"
+          fi
+
+      - name: Build Signed Release AAB (Android App Bundle) & APK
+        env:
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD || '52775277Tanzania' }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'upload' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || '52775277Tanzania' }}
+          KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
+        run: |
+          gradle bundleRelease assembleRelease assembleDebug --stacktrace
+
+      - name: Upload Release AAB (Google Play Bundle)
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: app/build/outputs/bundle/release/app-release.aab
+
+      - name: Upload Release Signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-signed-apk
+          path: app/build/outputs/apk/release/app-release.apk
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
