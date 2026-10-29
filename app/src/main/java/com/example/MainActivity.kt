@@ -40,6 +40,18 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: MusicViewModel by viewModels()
 
+    private val inAppUpdateManager by lazy {
+        com.example.update.InAppUpdateManager.getInstance(applicationContext)
+    }
+
+    private val appUpdateLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode != RESULT_OK) {
+            Log.w("MainActivity", "In-app update flow cancelled or failed with code: ${result.resultCode}")
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -71,9 +83,13 @@ class MainActivity : ComponentActivity() {
 
         handleIncomingAudioIntent(intent)
 
+        // Check for official Google Play In-App Updates on launch
+        inAppUpdateManager.checkForAppUpdate(isManualCheck = false)
+
         setContent {
             val currentLanguage by viewModel.currentLanguage.collectAsState()
             val currentStrings = remember(currentLanguage) { getAppStrings(currentLanguage) }
+            val updateState by inAppUpdateManager.updateState.collectAsState()
 
             CompositionLocalProvider(
                 LocalAppLanguage provides currentLanguage,
@@ -84,12 +100,32 @@ class MainActivity : ComponentActivity() {
                     Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                         MusicMainScreen(
                             viewModel = viewModel,
-                            modifier = Modifier.padding(innerPadding)
+                            modifier = Modifier.padding(innerPadding),
+                            inAppUpdateState = updateState,
+                            onStartAppUpdate = {
+                                inAppUpdateManager.startUpdate(this@MainActivity, appUpdateLauncher)
+                            },
+                            onDismissAppUpdate = { versionCode ->
+                                inAppUpdateManager.dismissPrompt(versionCode)
+                            },
+                            onCompleteAppUpdate = {
+                                inAppUpdateManager.completeUpdate()
+                            }
                         )
                     }
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        inAppUpdateManager.onResume(this, appUpdateLauncher)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        inAppUpdateManager.cleanup()
     }
 
     override fun onNewIntent(intent: Intent) {

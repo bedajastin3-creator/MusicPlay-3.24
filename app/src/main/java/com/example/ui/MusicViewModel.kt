@@ -35,6 +35,30 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putString("app_language", language.code).apply()
     }
 
+    // Song Sort Order
+    private val _trackSortOrder = MutableStateFlow(
+        com.example.data.TrackSortOrder.fromName(prefs.getString("track_sort_order", com.example.data.TrackSortOrder.TITLE_ASC.name))
+    )
+    val trackSortOrder: StateFlow<com.example.data.TrackSortOrder> = _trackSortOrder.asStateFlow()
+
+    fun setTrackSortOrder(order: com.example.data.TrackSortOrder) {
+        _trackSortOrder.value = order
+        prefs.edit().putString("track_sort_order", order.name).apply()
+    }
+
+    fun sortTracks(tracks: List<MusicTrack>, order: com.example.data.TrackSortOrder): List<MusicTrack> {
+        return when (order) {
+            com.example.data.TrackSortOrder.TITLE_ASC -> tracks.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
+            com.example.data.TrackSortOrder.TITLE_DESC -> tracks.sortedWith(compareByDescending(String.CASE_INSENSITIVE_ORDER) { it.title })
+            com.example.data.TrackSortOrder.SIZE_DESC -> tracks.sortedByDescending { it.sizeBytes }
+            com.example.data.TrackSortOrder.SIZE_ASC -> tracks.sortedBy { it.sizeBytes }
+            com.example.data.TrackSortOrder.DURATION_DESC -> tracks.sortedByDescending { it.durationSec }
+            com.example.data.TrackSortOrder.DURATION_ASC -> tracks.sortedBy { it.durationSec }
+            com.example.data.TrackSortOrder.ARTIST_ASC -> tracks.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.artist })
+            com.example.data.TrackSortOrder.DATE_ADDED_DESC -> tracks.sortedByDescending { it.dateAdded }
+        }
+    }
+
     // Observable states from DB
     val allTracks: StateFlow<List<MusicTrack>> = repository.allTracks
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())

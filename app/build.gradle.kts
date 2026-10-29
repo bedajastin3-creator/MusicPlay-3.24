@@ -119,6 +119,8 @@ dependencies {
   implementation("androidx.media:media:1.7.0")
   implementation(libs.coil.compose)
   implementation(libs.play.services.ads)
+  implementation(libs.play.app.update)
+  implementation(libs.play.app.update.ktx)
   implementation(libs.converter.moshi)
   implementation(libs.firebase.ai)
   implementation(libs.kotlinx.coroutines.android)

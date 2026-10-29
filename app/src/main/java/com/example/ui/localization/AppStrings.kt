@@ -131,7 +131,21 @@ data class AppStrings(
     val installButton: String,
     val whatsAppChannelTitle: String,
     val whatsAppChannelSubtitle: String,
-    val joinWhatsAppButton: String
+    val joinWhatsAppButton: String,
+
+    // Additional Sort options
+    val sortSizeDesc: String = "Size (Largest)",
+    val sortSizeAsc: String = "Size (Smallest)",
+    val sortDurationDesc: String = "Duration (Longest)",
+    val sortDurationAsc: String = "Duration (Shortest)",
+
+    // Google Play In-App Updates
+    val updateAvailableTitle: String = "Update Available",
+    val updateAvailableSubtitle: String = "A new version of MUSICPLAY is available on Google Play with new DJ effects and performance improvements.",
+    val updateNow: String = "Update Now",
+    val updateLater: String = "Later",
+    val updateDownloaded: String = "Update ready to install",
+    val restartToInstall: String = "Restart App"
 )
 
 val EnglishStrings = AppStrings(
@@ -1136,5 +1150,14 @@ fun getAppStrings(language: AppLanguage): AppStrings {
         AppLanguage.HINDI -> HindiStrings
         AppLanguage.JAPANESE -> JapaneseStrings
         AppLanguage.RUSSIAN -> RussianStrings
+        AppLanguage.VIETNAMESE -> VietnameseStrings
+        AppLanguage.SPANISH -> SpanishStrings
+        AppLanguage.PORTUGUESE_BRAZIL -> PortugueseBrazilStrings
+        AppLanguage.INDONESIAN -> IndonesianStrings
+        AppLanguage.THAI -> ThaiStrings
+        AppLanguage.TURKISH -> TurkishStrings
+        AppLanguage.GERMAN -> GermanStrings
+        AppLanguage.ITALIAN -> ItalianStrings
+        AppLanguage.KOREAN -> KoreanStrings
     }
 }

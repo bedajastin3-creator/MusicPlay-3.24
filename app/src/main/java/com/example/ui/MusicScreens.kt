@@ -62,6 +62,9 @@ import com.example.audio.RepeatMode
 import com.example.data.MusicTrack
 import com.example.data.PlaybackQueue
 import com.example.data.Playlist
+import com.example.data.TrackSortOrder
+import com.example.update.InAppUpdateState
+import androidx.compose.ui.window.DialogProperties
 import com.example.ui.localization.AppLanguage
 import com.example.ui.localization.LocalAppLanguage
 import com.example.ui.localization.LocalAppStrings
@@ -365,7 +368,14 @@ fun EmptyMusicStateCard(
 }
 
 @Composable
-fun MusicMainScreen(viewModel: MusicViewModel, modifier: Modifier = Modifier) {
+fun MusicMainScreen(
+    viewModel: MusicViewModel,
+    modifier: Modifier = Modifier,
+    inAppUpdateState: InAppUpdateState = InAppUpdateState.Idle,
+    onStartAppUpdate: () -> Unit = {},
+    onDismissAppUpdate: (Int) -> Unit = {},
+    onCompleteAppUpdate: () -> Unit = {}
+) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val strings = LocalAppStrings.current
@@ -789,8 +799,9 @@ fun MusicMainScreen(viewModel: MusicViewModel, modifier: Modifier = Modifier) {
                     )
                     "Songs" -> SongsListScreen(
                         tracks = tracks,
-                        onTrackClicked = { track ->
-                            viewModel.playbackManager.playTrack(track, tracks, tracks.indexOf(track))
+                        viewModel = viewModel,
+                        onTrackClicked = { track, list ->
+                            viewModel.playbackManager.playTrack(track, list, list.indexOf(track))
                         },
                         onMoreClicked = { trackForOptions = it }
                     )
@@ -982,6 +993,22 @@ fun MusicMainScreen(viewModel: MusicViewModel, modifier: Modifier = Modifier) {
             onPlayTrack = { track, list ->
                 viewModel.playbackManager.playTrack(track, list, list.indexOf(track))
             }
+        )
+    }
+
+    // Google Play In-App Updates Prompt (ChatGPT-like update experience)
+    if (inAppUpdateState is InAppUpdateState.UpdateAvailable) {
+        InAppUpdatePromptDialog(
+            updateState = inAppUpdateState,
+            onUpdateClicked = onStartAppUpdate,
+            onDismissClicked = onDismissAppUpdate
+        )
+    }
+
+    if (inAppUpdateState is InAppUpdateState.Downloaded) {
+        InAppUpdateDownloadedBanner(
+            onCompleteUpdate = onCompleteAppUpdate,
+            modifier = Modifier.padding(16.dp)
         )
     }
 }
@@ -1209,30 +1236,200 @@ fun ActiveQueueScreen(
     }
 }
 
-// SONGS LIST SCREEN (With query search and quick playback)
+// Helper to format audio file size
+fun formatFileSize(bytes: Long): String {
+    if (bytes <= 0L) return ""
+    val kb = bytes / 1024.0
+    val mb = kb / 1024.0
+    val gb = mb / 1024.0
+    return when {
+        gb >= 1.0 -> String.format(java.util.Locale.US, "%.1f GB", gb)
+        mb >= 1.0 -> String.format(java.util.Locale.US, "%.1f MB", mb)
+        else -> String.format(java.util.Locale.US, "%.0f KB", kb)
+    }
+}
+
+fun getSortLabel(order: TrackSortOrder, strings: com.example.ui.localization.AppStrings): String {
+    return when (order) {
+        TrackSortOrder.TITLE_ASC -> strings.sortTitleAsc
+        TrackSortOrder.TITLE_DESC -> strings.sortTitleDesc
+        TrackSortOrder.SIZE_DESC -> strings.sortSizeDesc
+        TrackSortOrder.SIZE_ASC -> strings.sortSizeAsc
+        TrackSortOrder.DURATION_DESC -> strings.sortDurationDesc
+        TrackSortOrder.DURATION_ASC -> strings.sortDurationAsc
+        TrackSortOrder.ARTIST_ASC -> strings.sortArtist
+        TrackSortOrder.DATE_ADDED_DESC -> strings.sortDateAdded
+    }
+}
+
+@Composable
+fun SortOptionsDialog(
+    currentSortOrder: TrackSortOrder,
+    onSortSelected: (TrackSortOrder) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val strings = LocalAppStrings.current
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(24.dp),
+            color = SpacePlayerBg,
+            border = BorderStroke(1.5.dp, TealPrimary.copy(alpha = 0.5f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Sort,
+                            contentDescription = null,
+                            tint = TealPrimary,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = strings.sortBy,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = TextLight
+                        )
+                    }
+                    IconButton(onClick = onDismiss, modifier = Modifier.size(28.dp)) {
+                        Icon(
+                            imageVector = Icons.Filled.Close,
+                            contentDescription = strings.close,
+                            tint = TextMuted,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 380.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    val sortOptions = listOf(
+                        TrackSortOrder.TITLE_ASC to Pair(strings.sortTitleAsc, Icons.Filled.TextFields),
+                        TrackSortOrder.TITLE_DESC to Pair(strings.sortTitleDesc, Icons.Filled.TextFields),
+                        TrackSortOrder.SIZE_DESC to Pair(strings.sortSizeDesc, Icons.Filled.Storage),
+                        TrackSortOrder.SIZE_ASC to Pair(strings.sortSizeAsc, Icons.Filled.Storage),
+                        TrackSortOrder.DURATION_DESC to Pair(strings.sortDurationDesc, Icons.Filled.Schedule),
+                        TrackSortOrder.DURATION_ASC to Pair(strings.sortDurationAsc, Icons.Filled.Schedule),
+                        TrackSortOrder.ARTIST_ASC to Pair(strings.sortArtist, Icons.Filled.Person),
+                        TrackSortOrder.DATE_ADDED_DESC to Pair(strings.sortDateAdded, Icons.Filled.CalendarMonth)
+                    )
+
+                    sortOptions.forEach { (order, pair) ->
+                        val (label, icon) = pair
+                        val isSelected = order == currentSortOrder
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 3.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable {
+                                    onSortSelected(order)
+                                    onDismiss()
+                                },
+                            color = if (isSelected) TealPrimary.copy(alpha = 0.16f) else SpaceCardBg,
+                            border = if (isSelected) BorderStroke(1.dp, TealPrimary) else null,
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = icon,
+                                        contentDescription = null,
+                                        tint = if (isSelected) TealPrimary else TextMuted,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Text(
+                                        text = label,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                        color = if (isSelected) TealPrimary else TextLight
+                                    )
+                                }
+                                if (isSelected) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Check,
+                                        contentDescription = "Selected",
+                                        tint = TealPrimary,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// SONGS LIST SCREEN (With search and dynamic sorting by name, size, duration, etc.)
 @Composable
 fun SongsListScreen(
     tracks: List<MusicTrack>,
-    onTrackClicked: (MusicTrack) -> Unit,
+    viewModel: MusicViewModel,
+    onTrackClicked: (MusicTrack, List<MusicTrack>) -> Unit,
     onMoreClicked: (MusicTrack) -> Unit
 ) {
     val strings = LocalAppStrings.current
     var searchQuery by remember { mutableStateOf("") }
-    val filteredTracks = tracks.filter {
-        it.title.contains(searchQuery, ignoreCase = true) ||
-        it.artist.contains(searchQuery, ignoreCase = true) ||
-        it.album.contains(searchQuery, ignoreCase = true) ||
-        it.genre.contains(searchQuery, ignoreCase = true)
+    val currentSortOrder by viewModel.trackSortOrder.collectAsState()
+    var showSortDialog by remember { mutableStateOf(false) }
+
+    val filteredTracks = remember(tracks, searchQuery) {
+        if (searchQuery.isBlank()) tracks
+        else tracks.filter {
+            it.title.contains(searchQuery, ignoreCase = true) ||
+            it.artist.contains(searchQuery, ignoreCase = true) ||
+            it.album.contains(searchQuery, ignoreCase = true) ||
+            it.genre.contains(searchQuery, ignoreCase = true)
+        }
+    }
+
+    val sortedTracks = remember(filteredTracks, currentSortOrder) {
+        viewModel.sortTracks(filteredTracks, currentSortOrder)
     }
 
     // Native Ad State for Songs list: Show ad after every 10 songs, if songs < 10 don't show ad
     // Uses Approved Native Unit ID 1: ca-app-pub-8155064094205693/7166498907
     val adsState = rememberSongNativeAdsState(
-        itemCount = filteredTracks.size,
+        itemCount = sortedTracks.size,
         adUnitId = NATIVE_AD_UNIT_1
     )
-    val songListItems = remember(filteredTracks, adsState.failedAdIndices.toList()) {
-        buildSongItemsWithAds(realItems = filteredTracks, failedAdIndices = adsState.failedAdIndices)
+    val songListItems = remember(sortedTracks, adsState.failedAdIndices.toList()) {
+        buildSongItemsWithAds(realItems = sortedTracks, failedAdIndices = adsState.failedAdIndices)
+    }
+
+    if (showSortDialog) {
+        SortOptionsDialog(
+            currentSortOrder = currentSortOrder,
+            onSortSelected = { order -> viewModel.setTrackSortOrder(order) },
+            onDismiss = { showSortDialog = false }
+        )
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -1258,9 +1455,61 @@ fun SongsListScreen(
             ),
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
+                .padding(horizontal = 16.dp, vertical = 8.dp),
             shape = RoundedCornerShape(24.dp)
         )
+
+        // Sorting & Count Control Bar
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = "${sortedTracks.size} ${strings.songsCount}",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted,
+                fontWeight = FontWeight.Medium
+            )
+
+            Surface(
+                onClick = { showSortDialog = true },
+                shape = RoundedCornerShape(20.dp),
+                color = SpaceCardBg,
+                border = BorderStroke(1.dp, TealPrimary.copy(alpha = 0.5f)),
+                modifier = Modifier.height(34.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.Sort,
+                        contentDescription = strings.sortBy,
+                        tint = TealPrimary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = getSortLabel(currentSortOrder, strings),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = TextLight,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Icon(
+                        imageVector = Icons.Filled.ArrowDropDown,
+                        contentDescription = null,
+                        tint = TextMuted,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
 
         LazyColumn(modifier = Modifier.fillMaxSize()) {
             items(
@@ -1278,7 +1527,7 @@ fun SongsListScreen(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { onTrackClicked(track) }
+                                .clickable { onTrackClicked(track, sortedTracks) }
                                 .padding(horizontal = 16.dp, vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
@@ -1298,8 +1547,20 @@ fun SongsListScreen(
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Row(verticalAlignment = Alignment.CenterVertically) {
+                                    val sizeStr = formatFileSize(track.sizeBytes)
+                                    val subText = buildString {
+                                        append(track.artist)
+                                        if (track.album.isNotBlank() && track.album != "Unknown Album") {
+                                            append(" • ")
+                                            append(track.album)
+                                        }
+                                        if (sizeStr.isNotBlank()) {
+                                            append(" • ")
+                                            append(sizeStr)
+                                        }
+                                    }
                                     Text(
-                                        text = "${track.artist} • ${track.album}",
+                                        text = subText,
                                         color = TextMuted,
                                         style = MaterialTheme.typography.bodySmall,
                                         maxLines = 1,
@@ -1339,8 +1600,196 @@ fun SongsListScreen(
                         val nativeAd = adsState.loadedAds[wrapper.adIndex]
                             ?: if (adsState.loadedAds.isNotEmpty()) adsState.loadedAds[wrapper.adIndex % adsState.loadedAds.size] else null
                         SongNativeAdRow(nativeAd = nativeAd)
+                        HorizontalDivider(
+                            color = SpaceCardBg.copy(alpha = 0.5f),
+                            modifier = Modifier.padding(horizontal = 16.dp)
+                        )
                     }
                 }
+            }
+        }
+    }
+}
+
+// In-App Update UI components (ChatGPT-style update experience)
+@Composable
+fun InAppUpdatePromptDialog(
+    updateState: InAppUpdateState.UpdateAvailable,
+    onUpdateClicked: () -> Unit,
+    onDismissClicked: (Int) -> Unit
+) {
+    val strings = LocalAppStrings.current
+    Dialog(
+        onDismissRequest = {
+            if (!updateState.isImmediate) {
+                onDismissClicked(updateState.availableVersionCode)
+            }
+        },
+        properties = DialogProperties(
+            dismissOnBackPress = !updateState.isImmediate,
+            dismissOnClickOutside = !updateState.isImmediate
+        )
+    ) {
+        Surface(
+            shape = RoundedCornerShape(24.dp),
+            color = SpacePlayerBg,
+            border = BorderStroke(1.5.dp, TealPrimary.copy(alpha = 0.5f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(CircleShape)
+                        .background(TealPrimary.copy(alpha = 0.2f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.SystemUpdate,
+                        contentDescription = "Update",
+                        tint = TealPrimary,
+                        modifier = Modifier.size(36.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Text(
+                    text = strings.updateAvailableTitle,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = TextLight,
+                    textAlign = TextAlign.Center
+                )
+
+                Spacer(modifier = Modifier.height(6.dp))
+
+                Surface(
+                    color = SpaceCardBg,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.padding(vertical = 4.dp)
+                ) {
+                    Text(
+                        text = "Google Play • v${updateState.availableVersionCode}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TealPrimary,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Text(
+                    text = strings.updateAvailableSubtitle,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextMuted,
+                    textAlign = TextAlign.Center,
+                    lineHeight = 20.sp
+                )
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                Button(
+                    onClick = onUpdateClicked,
+                    colors = ButtonDefaults.buttonColors(containerColor = TealPrimary),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Download,
+                        contentDescription = null,
+                        tint = OnTeal,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = strings.updateNow,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = OnTeal
+                    )
+                }
+
+                if (!updateState.isImmediate) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    TextButton(
+                        onClick = { onDismissClicked(updateState.availableVersionCode) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = strings.updateLater,
+                            color = TextMuted,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun InAppUpdateDownloadedBanner(
+    onCompleteUpdate: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val strings = LocalAppStrings.current
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(12.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = SpaceCardBg,
+        border = BorderStroke(1.dp, TealPrimary),
+        shadowElevation = 8.dp
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.CheckCircle,
+                    contentDescription = null,
+                    tint = TealPrimary,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                Text(
+                    text = strings.updateDownloaded,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = TextLight
+                )
+            }
+            Button(
+                onClick = onCompleteUpdate,
+                colors = ButtonDefaults.buttonColors(containerColor = TealPrimary),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+            ) {
+                Text(
+                    text = strings.restartToInstall,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = OnTeal
+                )
             }
         }
     }
@@ -3285,12 +3734,12 @@ fun DjEffectPads(
     val activeDjEffectName by viewModel.playbackManager.activeDjEffectName.collectAsState()
 
     val effects = listOf(
-        Triple(DjEffectType.VINYL_SCRATCH, "Scratch", Icons.Filled.Refresh),
+        Triple(DjEffectType.BABY_SCRATCH, "Baby Scratch", Icons.Filled.Refresh),
+        Triple(DjEffectType.FLARE_SCRATCH, "Flare Scratch", Icons.Filled.Speed),
+        Triple(DjEffectType.FLANGER, "Flanger", Icons.Filled.AutoAwesome),
         Triple(DjEffectType.FILTER_SWEEP, "Filter Sweep", Icons.Filled.Tune),
-        Triple(DjEffectType.BEAT_FILTER, "Beat Filter", Icons.Filled.Speed),
-        Triple(DjEffectType.RADIO_FILTER, "Radio Filter", Icons.Filled.Info),
-        Triple(DjEffectType.ECHO_OUT, "Echo & Decay", Icons.Filled.AutoAwesome),
-        Triple(DjEffectType.VINYL_SPIN_UP, "Spin-Up", Icons.Filled.PlayArrow)
+        Triple(DjEffectType.BEAT_FILTER, "Beat Filter", Icons.Filled.PlayArrow),
+        Triple(DjEffectType.ECHO_OUT, "Echo & Decay", Icons.Filled.Info)
     )
 
     Column(modifier = modifier.fillMaxWidth()) {

@@ -88,7 +88,9 @@ class MusicRepository(private val musicDao: MusicDao) {
             MediaStore.Audio.Media.DURATION,
             MediaStore.Audio.Media.DATA,
             MediaStore.Audio.Media.YEAR,
-            MediaStore.Audio.Media.TRACK
+            MediaStore.Audio.Media.TRACK,
+            MediaStore.Audio.Media.SIZE,
+            MediaStore.Audio.Media.DATE_ADDED
         )
 
         val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0"
@@ -105,6 +107,8 @@ class MusicRepository(private val musicDao: MusicDao) {
                 val dataColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
                 val yearColumn = cursor.getColumnIndex(MediaStore.Audio.Media.YEAR)
                 val trackColumn = cursor.getColumnIndex(MediaStore.Audio.Media.TRACK)
+                val sizeColumn = cursor.getColumnIndex(MediaStore.Audio.Media.SIZE)
+                val dateAddedColumn = cursor.getColumnIndex(MediaStore.Audio.Media.DATE_ADDED)
 
                 val albumArtUriBase = Uri.parse("content://media/external/audio/albumart")
 
@@ -120,12 +124,21 @@ class MusicRepository(private val musicDao: MusicDao) {
                     // Ignore tiny audio files (less than 3 seconds) which are typically notification pings/chimes
                     if (durationSec < 3) continue
 
+                    var fileSize = if (sizeColumn >= 0) cursor.getLong(sizeColumn) else 0L
+                    var dateAdded = if (dateAddedColumn >= 0) cursor.getLong(dateAddedColumn) else 0L
+
                     // Validate file path on disk if available to eliminate ghost / stale MediaStore rows
                     if (filePath.isNotBlank()) {
                         val file = java.io.File(filePath)
                         if (!file.exists()) continue
                         val canonical = try { file.canonicalPath } catch (_: Exception) { filePath }
                         if (!seenPaths.add(canonical)) continue
+                        if (fileSize <= 0L) {
+                            fileSize = try { file.length() } catch (_: Exception) { 0L }
+                        }
+                        if (dateAdded <= 0L) {
+                            dateAdded = try { file.lastModified() / 1000L } catch (_: Exception) { 0L }
+                        }
                     }
 
                     val mediaUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, mediaId).toString()
@@ -157,7 +170,9 @@ class MusicRepository(private val musicDao: MusicDao) {
                         contentUri = mediaUri,
                         albumArtUri = albumArtUri,
                         bitrate = "320 kbps",
-                        sampleRate = "44.1 kHz"
+                        sampleRate = "44.1 kHz",
+                        sizeBytes = fileSize,
+                        dateAdded = dateAdded
                     )
                     audioList.add(track)
                 }

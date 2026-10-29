@@ -10,6 +10,21 @@ enum class DjEffectType(
     val description: String,
     val preferredSection: DjSection
 ) {
+    BABY_SCRATCH(
+        displayName = "Baby Scratch",
+        description = "Authentic turntable forward-backward vinyl manipulation of the actual song",
+        preferredSection = DjSection.INTRO_OR_MID
+    ),
+    FLARE_SCRATCH(
+        displayName = "Flare Scratch",
+        description = "Advanced turntable flare scratch with rhythmic crossfader cuts into the song",
+        preferredSection = DjSection.INTRO_OR_MID
+    ),
+    FLANGER(
+        displayName = "Flanger",
+        description = "Genuine DSP flanger with sweeping LFO comb filter and wet/dry automation",
+        preferredSection = DjSection.MID_SONG
+    ),
     VINYL_SCRATCH(
         displayName = "Vinyl Scratch",
         description = "Crisp, controlled DJ vinyl scratch burst during musical breaks or transitions",

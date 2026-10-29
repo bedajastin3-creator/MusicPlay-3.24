@@ -19,7 +19,9 @@ data class MusicTrack(
     val contentUri: String = "",
     val albumArtUri: String = "",
     val bitrate: String = "",
-    val sampleRate: String = ""
+    val sampleRate: String = "",
+    val sizeBytes: Long = 0L,
+    val dateAdded: Long = 0L
 )
 
 @Entity(tableName = "playback_queues")

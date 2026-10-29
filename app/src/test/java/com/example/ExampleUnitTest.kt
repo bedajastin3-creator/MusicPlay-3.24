@@ -42,4 +42,67 @@ class ExampleUnitTest {
         val powerSum = (midGains.outGain * midGains.outGain) + (midGains.inGain * midGains.inGain)
         assertEquals(1.0f, powerSum, 0.02f)
     }
+
+    @Test
+    fun testTurntableScratchBabyAndFlareTechniques() {
+        val sampleRate = 22050
+        val engine = com.example.audio.TurntableScratchEngine(sampleRate)
+
+        // Generate synthetic test source PCM (1.5 seconds normalized -1.0f..1.0f)
+        val sourcePcm = FloatArray((sampleRate * 1.5).toInt()) { i ->
+            (kotlin.math.sin(2.0 * Math.PI * 440.0 * i / sampleRate) * 0.7).toFloat()
+        }
+
+        val babyPcm = engine.renderScratchPerformance(
+            sourcePcm = sourcePcm,
+            technique = com.example.audio.TurntableScratchEngine.ScratchTechnique.BABY_SCRATCH,
+            estimatedBpm = 120.0
+        )
+
+        val flarePcm = engine.renderScratchPerformance(
+            sourcePcm = sourcePcm,
+            technique = com.example.audio.TurntableScratchEngine.ScratchTechnique.FLARE_SCRATCH,
+            estimatedBpm = 120.0
+        )
+
+        // Verify valid output buffers
+        assertTrue("Baby scratch buffer must be populated", babyPcm.isNotEmpty())
+        assertTrue("Flare scratch buffer must be populated", flarePcm.isNotEmpty())
+
+        // Verify performance contains audio signal
+        val babyHasAudio = babyPcm.any { it != 0.toShort() }
+        val flareHasAudio = flarePcm.any { it != 0.toShort() }
+        assertTrue("Baby scratch must contain audible samples", babyHasAudio)
+        assertTrue("Flare scratch must contain audible samples", flareHasAudio)
+
+        // Verify Baby Scratch and Flare Scratch are independent techniques with distinct waveforms
+        var differences = 0
+        val minLen = minOf(babyPcm.size, flarePcm.size)
+        for (i in 0 until minLen) {
+            if (babyPcm[i] != flarePcm[i]) differences++
+        }
+        assertTrue("Baby scratch and Flare scratch must produce distinct waveforms", differences > minLen * 0.2)
+    }
+
+    @Test
+    fun testDspFlangerCombFiltering() {
+        val sampleRate = 22050
+        val flanger = com.example.audio.DspFlanger(sampleRate)
+
+        // Source buffer with harmonic content (FloatArray)
+        val source = FloatArray(sampleRate * 2) { i ->
+            (kotlin.math.sin(2.0 * Math.PI * 300.0 * i / sampleRate) * 0.6).toFloat()
+        }
+
+        val flanged = flanger.renderFlangedBuffer(source, estimatedBpm = 124.0)
+        assertEquals("Output buffer length should match input length", source.size, flanged.size)
+
+        val hasAudibleSamples = flanged.any { it != 0.toShort() }
+        assertTrue("Flanger output must contain audible samples", hasAudibleSamples)
+
+        // Check sample processing doesn't blow up or produce NaN
+        flanger.wetMix = 0.75f
+        val processed = flanger.processSample(0.5)
+        assertTrue("Flanger sample must remain bounded", processed in -1.0..1.0)
+    }
 }

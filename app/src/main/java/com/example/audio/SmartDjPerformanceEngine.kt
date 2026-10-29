@@ -30,7 +30,7 @@ class SmartDjPerformanceEngine(
 
     companion object {
         private const val TAG = "SmartDjEngine"
-        private const val MIN_TRACK_DURATION_FOR_EFFECTS_SEC = 15
+        private const val MIN_TRACK_DURATION_FOR_EFFECTS_SEC = 18
     }
 
     data class ScheduledDjMoment(
@@ -47,6 +47,7 @@ class SmartDjPerformanceEngine(
     val lastTriggeredEffectName: StateFlow<String?> = _lastTriggeredEffectName.asStateFlow()
 
     // Current track scheduling state
+    private var currentTrack: MusicTrack? = null
     private var currentScheduledTrackId: Int? = null
     private var pendingMoment: ScheduledDjMoment? = null
     private var lastHandledPositionSec = -1
@@ -55,7 +56,18 @@ class SmartDjPerformanceEngine(
     private var activeCrossfadeEnabled = true
 
     /**
+     * Estimates musical tempo (BPM) reliably for the given track.
+     */
+    fun estimateBpmForTrack(track: MusicTrack?): Double {
+        if (track == null) return 124.0
+        // Stable, deterministic tempo estimation between 112 and 132 BPM
+        val hash = (track.title.hashCode() xor track.artist.hashCode()).let { if (it < 0) -it else it }
+        return 112.0 + (hash % 21)
+    }
+
+    /**
      * Called whenever a new track begins or is loaded.
+     * Song 1 and all subsequent songs are fully eligible for DJ performance.
      */
     @Synchronized
     fun onTrackStarted(
@@ -66,6 +78,7 @@ class SmartDjPerformanceEngine(
     ) {
         cancelCurrentPerformance()
 
+        currentTrack = track
         currentScheduledTrackId = track.id
         trackDurationSec = track.durationSec.coerceAtLeast(30)
         activeCrossfadeSec = crossfadeSec
@@ -77,7 +90,7 @@ class SmartDjPerformanceEngine(
             return
         }
 
-        // Schedule first effect for this track (e.g. Intro reveal or early drop within seconds 3-7)
+        // Schedule first DJ moment (targeting ~16-20 seconds after track start)
         scheduleNextMoment(currentSec = 0)
     }
 
@@ -86,57 +99,92 @@ class SmartDjPerformanceEngine(
         val effectiveCfSec = if (activeCrossfadeEnabled) activeCrossfadeSec.coerceAtLeast(0) else 0
         val crossfadeStartSec = durationSec - effectiveCfSec
 
-        // Avoid scheduling inside or past the crossfade window
+        // Strict crossfade isolation: Never schedule inside or within 8 seconds of crossfade
         if (currentSec >= crossfadeStartSec - 8) {
             pendingMoment = null
             return
         }
 
-        val lastEffectForThisTrack = currentScheduledTrackId?.let { history.getLastEffectForTrack(it) }
-        val lastGlobalEffect = history.getLastGlobalEffect()
+        val trackId = currentScheduledTrackId
 
-        val (section, triggerSec) = when {
-            currentSec < 10 -> {
-                // Intro moment: between 3s and 7s
-                val introSec = Random.nextInt(3, 7.coerceAtMost(durationSec / 3).coerceAtLeast(4))
-                DjSection.INTRO to introSec
+        if (currentSec < 15) {
+            // ─────────────────────────────────────────────────────────────────
+            // 1. Initial Scratch Moment: Target approximately 16 to 20 seconds
+            // ─────────────────────────────────────────────────────────────────
+            val targetSec = Random.nextInt(16, 21).coerceAtMost((crossfadeStartSec - 8).coerceAtLeast(10))
+
+            // Intelligent selection: Baby Scratch, Flare Scratch, or Clean Play (~28% probability)
+            val isCleanPlay = Random.nextFloat() < 0.28f
+
+            if (isCleanPlay) {
+                // Record clean play in memory to encourage variation on replay
+                trackId?.let { history.recordCleanPlay(it) }
+                Log.d(TAG, "Track $trackId selected for clean intro play")
+                // Directly schedule mid-song moment instead
+                scheduleMidSongMoment(currentSec = targetSec + 4, crossfadeStartSec = crossfadeStartSec)
+            } else {
+                // Independent scratch technique selection with memory
+                val lastTrackEffect = trackId?.let { history.getLastEffectForTrack(it) }
+                val lastGlobalEffect = history.getLastGlobalEffect()
+
+                val chosenTechnique = when {
+                    lastTrackEffect == DjEffectType.BABY_SCRATCH -> DjEffectType.FLARE_SCRATCH
+                    lastTrackEffect == DjEffectType.FLARE_SCRATCH -> DjEffectType.BABY_SCRATCH
+                    lastGlobalEffect == DjEffectType.BABY_SCRATCH -> DjEffectType.FLARE_SCRATCH
+                    lastGlobalEffect == DjEffectType.FLARE_SCRATCH -> DjEffectType.BABY_SCRATCH
+                    else -> if (Random.nextBoolean()) DjEffectType.BABY_SCRATCH else DjEffectType.FLARE_SCRATCH
+                }
+
+                pendingMoment = ScheduledDjMoment(
+                    effectType = chosenTechnique,
+                    triggerPositionSec = targetSec,
+                    hasTriggered = false
+                )
+                Log.d(TAG, "Scheduled initial scratch ${chosenTechnique.displayName} at ${targetSec}s for track $trackId")
             }
-            currentSec < crossfadeStartSec - 25 -> {
-                // Mid-track moment: 20-35s ahead of current position
-                val nextSec = currentSec + Random.nextInt(20, 35)
-                val clamped = nextSec.coerceAtMost(crossfadeStartSec - 12)
-                DjSection.MID_SONG to clamped
-            }
-            else -> {
-                // Outro / transition moment: 6s before crossfade starts
-                val outroSec = (crossfadeStartSec - 6).coerceAtLeast(currentSec + 2)
-                DjSection.TRANSITION_OR_BREAK to outroSec
+        } else if (currentSec < crossfadeStartSec - 18) {
+            // ─────────────────────────────────────────────────────────────────
+            // 2. Mid-Song Moment: Genuine Flanger around middle of track
+            // ─────────────────────────────────────────────────────────────────
+            scheduleMidSongMoment(currentSec, crossfadeStartSec)
+        } else {
+            // ─────────────────────────────────────────────────────────────────
+            // 3. Outro Moment: 6s prior to crossfade start (strictly aborts on CF)
+            // ─────────────────────────────────────────────────────────────────
+            val outroSec = (crossfadeStartSec - 6).coerceAtLeast(currentSec + 2)
+            if (outroSec < crossfadeStartSec - 3) {
+                pendingMoment = ScheduledDjMoment(
+                    effectType = DjEffectType.ECHO_OUT,
+                    triggerPositionSec = outroSec,
+                    hasTriggered = false
+                )
+            } else {
+                pendingMoment = null
             }
         }
+    }
 
-        val candidateEffects = DjEffectType.entries.filter { effect ->
-            val matchesSection = when (section) {
-                DjSection.INTRO -> effect.preferredSection == DjSection.INTRO || effect.preferredSection == DjSection.INTRO_OR_MID
-                DjSection.MID_SONG -> effect.preferredSection == DjSection.MID_SONG || effect.preferredSection == DjSection.INTRO_OR_MID
-                DjSection.TRANSITION_OR_BREAK -> effect.preferredSection == DjSection.TRANSITION_OR_BREAK
-                else -> true
+    private fun scheduleMidSongMoment(currentSec: Int, crossfadeStartSec: Int) {
+        val midSec = (trackDurationSec * 0.52).toInt()
+        val triggerSec = midSec.coerceIn(currentSec + 5, (crossfadeStartSec - 12).coerceAtLeast(currentSec + 5))
+
+        if (triggerSec < crossfadeStartSec - 8) {
+            val lastGlobalEffect = history.getLastGlobalEffect()
+            val chosenEffect = if (lastGlobalEffect == DjEffectType.FLANGER && Random.nextFloat() < 0.35f) {
+                DjEffectType.FILTER_SWEEP
+            } else {
+                DjEffectType.FLANGER
             }
-            // Avoid repeating the exact effect used immediately prior
-            val notConsecutive = (effect != lastGlobalEffect)
-            matchesSection && notConsecutive
-        }.ifEmpty {
-            DjEffectType.entries.filter { it != lastGlobalEffect }
-        }.ifEmpty {
-            DjEffectType.entries.toList()
+
+            pendingMoment = ScheduledDjMoment(
+                effectType = chosenEffect,
+                triggerPositionSec = triggerSec,
+                hasTriggered = false
+            )
+            Log.d(TAG, "Scheduled mid-song ${chosenEffect.displayName} at ${triggerSec}s")
+        } else {
+            pendingMoment = null
         }
-
-        val chosenEffect = candidateEffects.random()
-
-        pendingMoment = ScheduledDjMoment(
-            effectType = chosenEffect,
-            triggerPositionSec = triggerSec,
-            hasTriggered = false
-        )
     }
 
     /**
@@ -157,6 +205,8 @@ class SmartDjPerformanceEngine(
         basePitch: Float,
         onVolumeDuck: ((Float) -> Unit)? = null
     ) {
+        currentTrack = track
+
         if (!isDjEffectsEnabled) {
             if (processor.isEffectActive) {
                 cancelCurrentPerformance(equalizer, reverb, baseEqGains, baseReverbPreset, mediaPlayer, basePitch, onVolumeDuck)
@@ -200,11 +250,13 @@ class SmartDjPerformanceEngine(
                 baseEqGains = baseEqGains,
                 baseReverbPreset = baseReverbPreset,
                 basePitch = basePitch,
+                track = track,
+                estimatedBpm = estimateBpmForTrack(track),
                 onVolumeDuck = onVolumeDuck,
                 onComplete = {
                     _isDjEffectExecuting.value = false
                     // Schedule next moment in this song if time permits
-                    scheduleNextMoment(currentPosSec + 4)
+                    scheduleNextMoment(currentPosSec + 6)
                 }
             )
         }
@@ -213,7 +265,7 @@ class SmartDjPerformanceEngine(
     }
 
     /**
-     * Direct manual trigger from UI pads (e.g. tapping "Scratch" or "Filter Sweep").
+     * Direct manual trigger from UI pads (e.g. tapping "Baby Scratch", "Flare Scratch", or "Flanger").
      */
     @Synchronized
     fun triggerManualEffect(
@@ -224,10 +276,12 @@ class SmartDjPerformanceEngine(
         baseEqGains: FloatArray,
         baseReverbPreset: String,
         basePitch: Float,
+        track: MusicTrack? = null,
         onVolumeDuck: ((Float) -> Unit)? = null
     ) {
         _isDjEffectExecuting.value = true
         _lastTriggeredEffectName.value = effect.displayName
+        val activeTrack = track ?: currentTrack
         currentScheduledTrackId?.let { history.recordEffect(it, effect) }
 
         processor.triggerEffect(
@@ -238,6 +292,8 @@ class SmartDjPerformanceEngine(
             baseEqGains = baseEqGains,
             baseReverbPreset = baseReverbPreset,
             basePitch = basePitch,
+            track = activeTrack,
+            estimatedBpm = estimateBpmForTrack(activeTrack),
             onVolumeDuck = onVolumeDuck,
             onComplete = {
                 _isDjEffectExecuting.value = false

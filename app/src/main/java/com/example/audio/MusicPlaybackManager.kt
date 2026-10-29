@@ -903,6 +903,7 @@ class MusicPlaybackManager {
             baseEqGains = _eqGains.value,
             baseReverbPreset = _reverbPreset.value,
             basePitch = _pitch.value,
+            track = _currentTrack.value,
             onVolumeDuck = { duck -> applyDuckedVolume(duck) }
         )
     }
