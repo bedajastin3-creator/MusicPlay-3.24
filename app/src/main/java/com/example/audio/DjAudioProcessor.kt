@@ -45,6 +45,7 @@ class DjAudioProcessor(private val context: Context) {
     val songAudioDecoder = SongAudioDecoder(context)
     val turntableScratchEngine = TurntableScratchEngine(SAMPLE_RATE)
     val dspFlanger = DspFlanger(SAMPLE_RATE)
+    val dspRhythmicEcho = DspRhythmicEcho(SAMPLE_RATE)
 
     // Scratch audio storage
     private var scratchFiles = mutableListOf<File>()
@@ -168,7 +169,7 @@ class DjAudioProcessor(private val context: Context) {
                         executeRadioFilter(equalizer, baseEqGains, onVolumeDuck)
                     }
                     DjEffectType.ECHO_OUT -> {
-                        executeEchoOut(reverb, baseReverbPreset, onVolumeDuck)
+                        executeEchoOut(reverb, baseReverbPreset, equalizer, baseEqGains, estimatedBpm, onVolumeDuck)
                     }
                     DjEffectType.VINYL_SPIN_UP -> {
                         executeVinylSpinUp(mediaPlayer, basePitch, onVolumeDuck)
@@ -260,7 +261,7 @@ class DjAudioProcessor(private val context: Context) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    // 2. Genuine DSP Flanger Performance
+    // 2. Genuine DSP Flanger Performance (Live Advancing Audio, Zero Repetition)
     // ─────────────────────────────────────────────────────────────────────────────
 
     private suspend fun executeFlangerPerformance(
@@ -272,70 +273,51 @@ class DjAudioProcessor(private val context: Context) {
     ) {
         pcmEffectMode = 7 // FLANGER
 
-        // 1. Extract mid-song audio slice (~6.0s) around middle portion of track
-        val midSec = if (track != null && track.durationSec > 35) {
-            (track.durationSec * 0.50).toInt().coerceAtLeast(18)
-        } else 30
+        // Synchronize LFO sweep rate to track tempo (e.g. 1 sweep cycle across 2 musical bars)
+        val beatSec = (60.0 / estimatedBpm.coerceIn(75.0, 160.0))
+        val barSec = beatSec * 4.0
+        val lfoRate = (1.0 / (barSec * 1.5)).coerceIn(0.12, 0.30)
+        dspFlanger.lfoFrequencyHz = lfoRate
+        dspFlanger.reset()
 
-        val snippetPcm = if (track != null && track.contentUri.isNotBlank()) {
-            songAudioDecoder.extractAudioSnippet(
-                contentUri = track.contentUri,
-                startOffsetSec = midSec,
-                durationSec = 6.0,
-                fallbackSeed = track.id
-            )
-        } else {
-            songAudioDecoder.extractAudioSnippet("", 0, 6.0, track?.id ?: 120)
-        }
+        // CONTINUOUS LIVE ADVANCING AUDIO:
+        // Never loop, never replay previous sections, never launch secondary MediaPlayer.
+        // The song continues advancing normally while sweeping metallic comb-filtering sweeps through it.
+        val totalSteps = 56 // ~4.5 seconds total sweep duration
+        val fadeInSteps = 14
+        val fadeOutStart = totalSteps - 14
 
-        // 2. Render flanged audio layer with automated wet-dry fade-in / sweep / fade-out
-        val flangedPcm = dspFlanger.renderFlangedBuffer(snippetPcm, estimatedBpm)
-        val tempWavFile = writeWavToFiles("dj_flanger_perf.wav", flangedPcm)
-
-        // 3. Play flanged layer alongside ducked primary player
-        onVolumeDuck?.invoke(0.45f)
-
-        withContext(Dispatchers.Main) {
-            try {
-                scratchMediaPlayer?.release()
-                scratchMediaPlayer = MediaPlayer().apply {
-                    setDataSource(context, Uri.fromFile(tempWavFile))
-                    setVolume(0.95f, 0.95f)
-                    prepare()
-                    start()
-                    setOnCompletionListener { mp ->
-                        try { mp.release() } catch (_: Throwable) {}
-                        if (scratchMediaPlayer == mp) scratchMediaPlayer = null
-                    }
-                }
-            } catch (e: Throwable) {
-                Log.w(TAG, "Flanger audio playback: ${e.message}")
-            }
-        }
-
-        // 4. Modulate hardware Equalizer in sync with LFO across the sweep for deep comb filtering
-        val totalSteps = 45
         for (i in 1..totalSteps) {
-            val t = i.toDouble() / totalSteps
+            val progress = i.toDouble() / totalSteps
+
+            // Smooth dry -> wet -> dry intensity automation curve
+            val wet = when {
+                i <= fadeInSteps -> (i.toFloat() / fadeInSteps) * 0.85f
+                i >= fadeOutStart -> ((totalSteps - i).toFloat() / 14f) * 0.85f
+                else -> 0.85f
+            }
+            dspFlanger.wetMix = wet
+
+            // Modulate platform hardware Equalizer with sweeping acoustic comb-filtering in sync with LFO
             equalizer?.let { eq ->
                 try {
                     val numBands = min(eq.numberOfBands.toInt(), baseGains.size)
                     val range = eq.bandLevelRange
+                    val lfoAngle = progress * Math.PI * 4.0 // 2 full sweeping cycles across performance
                     for (b in 0 until numBands) {
-                        val phaseOffset = (b.toDouble() / numBands) * Math.PI
-                        val gainOffset = sin(t * Math.PI * 3.0 + phaseOffset) * 6.5
+                        // Alternate band phase distribution simulates sweeping comb filter peaks & notches
+                        val phaseOffset = (b.toDouble() / numBands) * Math.PI * 2.0
+                        val gainOffset = sin(lfoAngle + phaseOffset) * (7.0 * (wet / 0.85f))
                         val mb = ((baseGains[b] + gainOffset) * 100).toInt().coerceIn(range[0].toInt(), range[1].toInt()).toShort()
                         eq.setBandLevel(b.toShort(), mb)
                     }
                 } catch (_: Throwable) {}
             }
-            delay(120)
+            delay(80)
         }
 
-        // 5. Smooth return to dry normal playback
-        onVolumeDuck?.invoke(0.80f)
-        delay(70)
-        onVolumeDuck?.invoke(1.0f)
+        dspFlanger.wetMix = 0.0f
+        dspFlanger.reset()
         pcmEffectMode = 0
     }
 
@@ -457,30 +439,60 @@ class DjAudioProcessor(private val context: Context) {
     private suspend fun executeEchoOut(
         reverb: PresetReverb?,
         basePreset: String,
+        equalizer: Equalizer?,
+        baseGains: FloatArray,
+        estimatedBpm: Double,
         onVolumeDuck: ((Float) -> Unit)?
     ) {
         pcmEffectMode = 5 // ECHO
-        echoMixLevel = 0.0f
-        echoFeedback = 0.60f
+        dspRhythmicEcho.reset()
+        // Musical interval: Dotted 1/8 note synchronized to tempo with controlled 0.52 feedback
+        dspRhythmicEcho.configureTempo(
+            estimatedBpm = estimatedBpm,
+            division = DspRhythmicEcho.EchoDivision.DOTTED_EIGHTH,
+            feedbackRatio = 0.52f
+        )
 
+        // Set spatial acoustics on platform hardware reverb
         reverb?.let { rev ->
             try {
                 rev.preset = PresetReverb.PRESET_LARGEHALL
             } catch (_: Throwable) {}
         }
 
-        for (i in 1..20) {
-            echoMixLevel = (i.toFloat() / 20.0f) * 0.70f
-            delay(50)
+        // Phase 1: Smooth Wet Ramp-In & Rhythmic Echo Capture (~1.4 seconds)
+        val captureSteps = 18
+        for (i in 1..captureSteps) {
+            val wet = (i.toFloat() / captureSteps) * 0.65f
+            dspRhythmicEcho.wetMix = wet
+            equalizer?.let { eq ->
+                try {
+                    val numBands = min(eq.numberOfBands.toInt(), baseGains.size)
+                    val range = eq.bandLevelRange
+                    for (b in 0 until numBands) {
+                        // Gentle high-shelf roll-off during echo to emphasize warm analog tape repeats
+                        val dbOffset = if (b >= numBands - 2) -4.0f * (wet / 0.65f) else 1.5f * (wet / 0.65f)
+                        val mb = ((baseGains[b] + dbOffset) * 100).toInt().coerceIn(range[0].toInt(), range[1].toInt()).toShort()
+                        eq.setBandLevel(b.toShort(), mb)
+                    }
+                } catch (_: Throwable) {}
+            }
+            delay(80)
         }
 
-        delay(800)
-
-        for (i in 20 downTo 1) {
-            echoMixLevel = (i.toFloat() / 20.0f) * 0.70f
-            delay(40)
+        // Phase 2: Natural Tail Decay (~2.2 seconds)
+        // Mute new input into delay line: existing echo repetitions decay naturally into silence
+        // without harsh cutoffs, clipping, or interfering with incoming playback
+        dspRhythmicEcho.isInputMuted = true
+        val decaySteps = 22
+        for (i in decaySteps downTo 1) {
+            val wet = (i.toFloat() / decaySteps) * 0.65f
+            dspRhythmicEcho.wetMix = wet
+            delay(100)
         }
-        echoMixLevel = 0.0f
+
+        dspRhythmicEcho.wetMix = 0.0f
+        dspRhythmicEcho.reset()
         pcmEffectMode = 0
     }
 
@@ -560,19 +572,15 @@ class DjAudioProcessor(private val context: Context) {
                 sample = tanh(band * 1.4) * 0.90
             }
             5 -> {
-                // ECHO RING BUFFER
-                val delayed = echoBuffer[echoBufferIndex]
-                val output = sample + (delayed * echoMixLevel)
-                echoBuffer[echoBufferIndex] = (sample + (delayed * echoFeedback)).toFloat().coerceIn(-1.0f, 1.0f)
-                echoBufferIndex = (echoBufferIndex + 1) % echoDelaySamples
-                sample = output
+                // RHYTHMIC TAPE ECHO (DspRhythmicEcho)
+                sample = dspRhythmicEcho.processSample(sample)
             }
             6 -> {
                 // SPIN UP
                 sample *= spinUpProgress
             }
             7 -> {
-                // FLANGER
+                // FLANGER (DspFlanger)
                 sample = dspFlanger.processSample(sample)
             }
         }
@@ -596,6 +604,10 @@ class DjAudioProcessor(private val context: Context) {
         activeJob?.cancel()
         activeJob = null
         pcmEffectMode = 0
+        dspFlanger.wetMix = 0f
+        dspFlanger.reset()
+        dspRhythmicEcho.wetMix = 0f
+        dspRhythmicEcho.reset()
         restoreBaseAudioStates(equalizer, reverb, baseEqGains, baseReverbPreset, mediaPlayer, basePitch, onVolumeDuck)
         isEffectActive = false
         activeEffectType = null
@@ -663,6 +675,8 @@ class DjAudioProcessor(private val context: Context) {
             scratchMediaPlayer?.release()
         } catch (_: Throwable) {}
         scratchMediaPlayer = null
+        dspFlanger.reset()
+        dspRhythmicEcho.reset()
         songAudioDecoder.clearCache()
     }
 

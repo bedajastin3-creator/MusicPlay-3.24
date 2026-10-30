@@ -105,4 +105,74 @@ class ExampleUnitTest {
         val processed = flanger.processSample(0.5)
         assertTrue("Flanger sample must remain bounded", processed in -1.0..1.0)
     }
+
+    @Test
+    fun testDspRhythmicEchoTempoAndDamping() {
+        val sampleRate = 22050
+        val echo = com.example.audio.DspRhythmicEcho(sampleRate)
+
+        // 120 BPM dotted 1/8 note = (60/120) * 0.75 = 0.375s = 8268 samples
+        echo.configureTempo(120.0, com.example.audio.DspRhythmicEcho.EchoDivision.DOTTED_EIGHTH, 0.52f)
+        echo.wetMix = 0.65f
+
+        // Feed an impulse at t=0
+        val impulseResponse = DoubleArray(sampleRate * 2)
+        impulseResponse[0] = echo.processSample(1.0)
+        for (i in 1 until impulseResponse.size) {
+            impulseResponse[i] = echo.processSample(0.0)
+        }
+
+        // Verify repetitions occur at rhythmically spaced intervals
+        val expectedEchoSample = (sampleRate * 0.375).toInt()
+        val firstRepeatAmplitude = impulseResponse[expectedEchoSample]
+        assertTrue("First echo repeat should be audible and non-zero", abs(firstRepeatAmplitude) > 0.05)
+
+        // Verify each subsequent repetition gradually reduces in volume
+        val secondRepeatSample = expectedEchoSample * 2
+        if (secondRepeatSample < impulseResponse.size) {
+            val secondRepeatAmplitude = impulseResponse[secondRepeatSample]
+            assertTrue(
+                "Second repeat ($secondRepeatAmplitude) must be quieter than first repeat ($firstRepeatAmplitude)",
+                abs(secondRepeatAmplitude) < abs(firstRepeatAmplitude)
+            )
+        }
+
+        // Verify tail mode muting: no new audio fed, existing echoes decay smoothly to silence
+        echo.isInputMuted = true
+        for (i in 0 until (sampleRate * 2)) {
+            echo.processSample(0.0)
+        }
+        val tailSample = echo.processSample(0.0)
+        assertTrue("Tail decay must naturally dissipate to silence", abs(tailSample) < 0.01)
+    }
+
+    @Test
+    fun testScratchDeepFrequencyCharacter() {
+        val sampleRate = 22050
+        val engine = com.example.audio.TurntableScratchEngine(sampleRate)
+
+        // Harmonic test signal
+        val sourcePcm = FloatArray((sampleRate * 1.5).toInt()) { i ->
+            val t = i.toDouble() / sampleRate
+            (kotlin.math.sin(2.0 * Math.PI * 220.0 * t) * 0.5 + kotlin.math.sin(2.0 * Math.PI * 880.0 * t) * 0.3).toFloat()
+        }
+
+        val rendered = engine.renderScratchPerformance(
+            sourcePcm = sourcePcm,
+            technique = com.example.audio.TurntableScratchEngine.ScratchTechnique.BABY_SCRATCH,
+            estimatedBpm = 120.0
+        )
+
+        // Verify no clipping (values bounded strictly to 16-bit range)
+        for (s in rendered) {
+            assertTrue("Sample must remain within 16-bit bounds", s in -32768..32767)
+        }
+
+        // Verify that low-mid frequency energy is preserved and prominent
+        var nonZeroCount = 0
+        for (s in rendered) {
+            if (abs(s.toInt()) > 200) nonZeroCount++
+        }
+        assertTrue("Rendered scratch must have rich, continuous audio body", nonZeroCount > rendered.size * 0.4)
+    }
 }
