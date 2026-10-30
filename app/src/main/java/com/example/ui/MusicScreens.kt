@@ -3732,14 +3732,16 @@ fun DjEffectPads(
     val isPlaying by viewModel.playbackManager.isPlaying.collectAsState()
     val isDjEffectExecuting by viewModel.playbackManager.isDjEffectExecuting.collectAsState()
     val activeDjEffectName by viewModel.playbackManager.activeDjEffectName.collectAsState()
+    val awarenessType by viewModel.smartAudioContentType.collectAsState()
 
     val effects = listOf(
         Triple(DjEffectType.BABY_SCRATCH, "Baby Scratch", Icons.Filled.Refresh),
         Triple(DjEffectType.FLARE_SCRATCH, "Flare Scratch", Icons.Filled.Speed),
+        Triple(DjEffectType.EIGHT_BEAT_LOOP, "8-Beat Loop", Icons.Filled.Loop),
         Triple(DjEffectType.FLANGER, "Flanger", Icons.Filled.AutoAwesome),
         Triple(DjEffectType.FILTER_SWEEP, "Filter Sweep", Icons.Filled.Tune),
         Triple(DjEffectType.BEAT_FILTER, "Beat Filter", Icons.Filled.PlayArrow),
-        Triple(DjEffectType.ECHO_OUT, "Echo & Decay", Icons.Filled.Info)
+        Triple(DjEffectType.ECHO_OUT, "Echo & Decay", Icons.Filled.GraphicEq)
     )
 
     Column(modifier = modifier.fillMaxWidth()) {
@@ -3748,12 +3750,53 @@ fun DjEffectPads(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = "Live DJ FX Pads",
-                style = MaterialTheme.typography.bodySmall,
-                color = TextLight,
-                fontWeight = FontWeight.Bold
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "Live DJ FX Pads",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextLight,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                // Real-Time Smart Music Awareness Badge
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = when (awarenessType) {
+                        com.example.audio.SmartAudioClassifier.AudioContentType.BEAT_ONLY -> TealPrimary.copy(alpha = 0.20f)
+                        com.example.audio.SmartAudioClassifier.AudioContentType.BEAT_AND_VOCALS -> AmberAccent.copy(alpha = 0.20f)
+                        com.example.audio.SmartAudioClassifier.AudioContentType.SPOKEN_VOICE -> Color(0xFF9C27B0).copy(alpha = 0.20f)
+                        com.example.audio.SmartAudioClassifier.AudioContentType.ACAPELLA_SINGING -> Color(0xFF2196F3).copy(alpha = 0.20f)
+                        com.example.audio.SmartAudioClassifier.AudioContentType.INSTRUMENTAL_MELODIC -> Color(0xFF4CAF50).copy(alpha = 0.20f)
+                        com.example.audio.SmartAudioClassifier.AudioContentType.UNCERTAIN -> SpaceCardBg
+                    },
+                    border = BorderStroke(
+                        1.dp,
+                        when (awarenessType) {
+                            com.example.audio.SmartAudioClassifier.AudioContentType.BEAT_ONLY -> TealPrimary
+                            com.example.audio.SmartAudioClassifier.AudioContentType.BEAT_AND_VOCALS -> AmberAccent
+                            com.example.audio.SmartAudioClassifier.AudioContentType.SPOKEN_VOICE -> Color(0xFFBA68C8)
+                            com.example.audio.SmartAudioClassifier.AudioContentType.ACAPELLA_SINGING -> Color(0xFF64B5F6)
+                            com.example.audio.SmartAudioClassifier.AudioContentType.INSTRUMENTAL_MELODIC -> Color(0xFF81C784)
+                            com.example.audio.SmartAudioClassifier.AudioContentType.UNCERTAIN -> TextMuted.copy(alpha = 0.3f)
+                        }
+                    )
+                ) {
+                    Text(
+                        text = "● ${awarenessType.displayName}",
+                        style = TextStyle(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
+                        color = when (awarenessType) {
+                            com.example.audio.SmartAudioClassifier.AudioContentType.BEAT_ONLY -> TealPrimary
+                            com.example.audio.SmartAudioClassifier.AudioContentType.BEAT_AND_VOCALS -> AmberAccent
+                            com.example.audio.SmartAudioClassifier.AudioContentType.SPOKEN_VOICE -> Color(0xFFCE93D8)
+                            com.example.audio.SmartAudioClassifier.AudioContentType.ACAPELLA_SINGING -> Color(0xFF90CAF9)
+                            com.example.audio.SmartAudioClassifier.AudioContentType.INSTRUMENTAL_MELODIC -> Color(0xFFA5D6A7)
+                            com.example.audio.SmartAudioClassifier.AudioContentType.UNCERTAIN -> TextMuted
+                        },
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                    )
+                }
+            }
+
             if (isDjEffectExecuting && activeDjEffectName != null) {
                 Surface(
                     shape = RoundedCornerShape(4.dp),
@@ -3769,7 +3812,7 @@ fun DjEffectPads(
                 }
             } else {
                 Text(
-                    text = "Tap any pad to hear live",
+                    text = "Tap pad to audition",
                     style = TextStyle(fontSize = 10.sp, color = TextMuted)
                 )
             }

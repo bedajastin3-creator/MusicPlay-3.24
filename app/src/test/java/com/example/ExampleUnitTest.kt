@@ -175,4 +175,96 @@ class ExampleUnitTest {
         }
         assertTrue("Rendered scratch must have rich, continuous audio body", nonZeroCount > rendered.size * 0.4)
     }
+
+    @Test
+    fun testEightBeatLoopBpmDurationAndRendering() {
+        val sampleRate = 22050
+        val loopEngine = com.example.audio.DspEightBeatLoopEngine(sampleRate)
+
+        // 120 BPM: 8 beats = 8 * (60 / 120) = 4.0 seconds
+        val dur120 = loopEngine.calculateEightBeatDurationSec(120.0)
+        assertEquals(4.0, dur120, 0.001)
+
+        // 140 BPM: 8 beats = 8 * (60 / 140) ~ 3.42857 seconds
+        val dur140 = loopEngine.calculateEightBeatDurationSec(140.0)
+        assertEquals(3.42857, dur140, 0.001)
+
+        // 160 BPM: 8 beats = 8 * (60 / 160) = 3.0 seconds
+        val dur160 = loopEngine.calculateEightBeatDurationSec(160.0)
+        assertEquals(3.0, dur160, 0.001)
+
+        // Generate synthetic source PCM
+        val sourcePcm = ShortArray((sampleRate * 4.5).toInt()) { i ->
+            (kotlin.math.sin(2.0 * Math.PI * 110.0 * i / sampleRate) * 16000.0).toInt().toShort()
+        }
+
+        // Render 2 cycles of 8-beat loop at 120 BPM (expected 8.0 seconds total = 176400 samples)
+        val renderedLoop = loopEngine.renderEightBeatLoop(sourcePcm, 120.0, repeatCount = 2)
+        val expectedSamples = (4.0 * sampleRate * 2).toInt()
+        assertEquals(expectedSamples, renderedLoop.size)
+        assertTrue("Loop buffer must have audible samples", renderedLoop.any { it != 0.toShort() })
+    }
+
+    @Test
+    fun testSmartAudioClassifierBeatOnly() {
+        val sampleRate = 22050
+        val classifier = com.example.audio.SmartAudioClassifier(sampleRate)
+
+        // Create heavy rhythmic bass beat kick pulses (60 Hz kicks with high transient crest factor, no vocals)
+        val beatPcm = ShortArray(sampleRate * 1) { i ->
+            val phase = (i % (sampleRate / 2)).toDouble() / (sampleRate / 2) // 2 kicks per sec
+            val env = kotlin.math.exp(-phase * 12.0)
+            (kotlin.math.sin(2.0 * Math.PI * 65.0 * i / sampleRate) * env * 26000.0).toInt().toShort()
+        }
+
+        val result = classifier.classifySingleBuffer(beatPcm)
+        assertTrue("Beat strength must be detected as strong", result.beatStrength >= 0.40f)
+        assertEquals(com.example.audio.SmartAudioClassifier.AudioContentType.BEAT_ONLY, result.type)
+    }
+
+    @Test
+    fun testSmartAudioClassifierAcapellaSingingVersusSpeech() {
+        val sampleRate = 22050
+        val classifier = com.example.audio.SmartAudioClassifier(sampleRate)
+
+        // Melodic singing: sustained F0 at 260 Hz with integer harmonics (520 Hz, 780 Hz) and vibrato
+        val acapellaPcm = ShortArray(sampleRate * 1) { i ->
+            val t = i.toDouble() / sampleRate
+            val vibrato = kotlin.math.sin(2.0 * Math.PI * 5.0 * t) * 6.0
+            val f0 = 260.0 + vibrato
+            val s1 = kotlin.math.sin(2.0 * Math.PI * f0 * t) * 0.6
+            val s2 = kotlin.math.sin(2.0 * Math.PI * (f0 * 2.0) * t) * 0.3
+            val s3 = kotlin.math.sin(2.0 * Math.PI * (f0 * 3.0) * t) * 0.1
+            ((s1 + s2 + s3) * 20000.0).toInt().toShort()
+        }
+
+        val acapellaResult = classifier.classifySingleBuffer(acapellaPcm)
+        assertTrue("Acapella must have high harmonicity", acapellaResult.harmonicity >= 0.45f)
+        assertEquals(
+            "Melodic singing must NOT be classified as speech",
+            com.example.audio.SmartAudioClassifier.AudioContentType.ACAPELLA_SINGING,
+            acapellaResult.type
+        )
+    }
+
+    @Test
+    fun testDspRhythmicEchoRenderBufferOutput() {
+        val sampleRate = 22050
+        val echo = com.example.audio.DspRhythmicEcho(sampleRate)
+
+        val snippet = ShortArray(sampleRate * 2) { i ->
+            (kotlin.math.sin(2.0 * Math.PI * 440.0 * i / sampleRate) * 15000.0).toInt().toShort()
+        }
+
+        val echoBuffer = echo.renderEchoBuffer(snippet, estimatedBpm = 120.0)
+        // Verify buffer extends beyond snippet size for decay tail (~1.8 seconds extra)
+        val expectedMinSamples = snippet.size + (sampleRate * 1.5).toInt()
+        assertTrue("Echo buffer must contain decay tail samples", echoBuffer.size >= expectedMinSamples)
+
+        // Verify audio content is audible and bounded
+        assertTrue("Echo buffer must contain audible samples", echoBuffer.any { it != 0.toShort() })
+        for (s in echoBuffer) {
+            assertTrue(s in -32768..32767)
+        }
+    }
 }

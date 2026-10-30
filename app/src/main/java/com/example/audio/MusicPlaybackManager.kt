@@ -163,6 +163,9 @@ class MusicPlaybackManager {
     private val _activeDjEffectName = MutableStateFlow<String?>(null)
     val activeDjEffectName = _activeDjEffectName.asStateFlow()
 
+    private val _smartAudioContentType = MutableStateFlow(SmartAudioClassifier.AudioContentType.UNCERTAIN)
+    val smartAudioContentType = _smartAudioContentType.asStateFlow()
+
     private val _djCurveType = MutableStateFlow(DjCurveType.EQUAL_POWER.name)
     val djCurveType = _djCurveType.asStateFlow()
 
@@ -231,11 +234,18 @@ class MusicPlaybackManager {
             djPerformanceHistory = hist
             djPerformanceEngine = engine
 
+            engine.onSpeechAwareCrossfadeRequested = {
+                triggerSpeechAwareCrossfade()
+            }
+
             scope.launch {
                 engine.isDjEffectExecuting.collect { _isDjEffectExecuting.value = it }
             }
             scope.launch {
                 engine.lastTriggeredEffectName.collect { _activeDjEffectName.value = it }
+            }
+            scope.launch {
+                engine.currentAudioContentType.collect { _smartAudioContentType.value = it }
             }
         }
     }
@@ -419,6 +429,20 @@ class MusicPlaybackManager {
             if (t >= 1f) {
                 completeDjCrossfade()
             }
+        }
+    }
+    /**
+     * Smoothly triggers speech-aware crossfade when spoken words are identified near track end.
+     * Prevents competing transitions and preserves the exact 20-second crossfade curve.
+     */
+    fun triggerSpeechAwareCrossfade() {
+        synchronized(crossfadeLock) {
+            if (_isCrossfading.value) return
+            val nextTrack = getNextTrack() ?: return
+            val cfSec = _crossfadeSec.value.coerceIn(5, 25)
+            val effectiveCfMs = cfSec * 1000
+            Log.d("MusicPlaybackManager", "Speech detected near track end. Initiating smooth speech-aware crossfade.")
+            triggerDjCrossfade(effectiveCfMs, nextTrack)
         }
     }
 

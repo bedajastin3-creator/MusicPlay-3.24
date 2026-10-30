@@ -6,21 +6,28 @@ import android.media.audiofx.Equalizer
 import android.media.audiofx.PresetReverb
 import android.util.Log
 import com.example.data.MusicTrack
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlin.random.Random
 
 /**
- * Smart Random DJ Performance Engine.
+ * Smart Random DJ Performance Engine with Real-Time Audio Awareness.
  * 
  * An intelligent, state-aware scheduler that dynamically decides:
- * 1. Which effect is musically suitable (Intro reveal, mid-track filter/break, or outro scratch/echo-out).
- * 2. Exact musical placement and timing while strictly respecting existing crossfade boundaries.
- * 3. Playlist replay variation: Uses lightweight history to favor different outcomes when replaying
- *    the same playlist, avoiding repetitive effect sequences or consecutive song repetitions.
- * 4. Safe isolation: Never interferes with or resets the existing crossfade or track playback position.
- * 5. Direct manual pad triggering: Allows instant auditioning of any effect on demand.
+ * 1. Smart Music Awareness: Detects BEAT ONLY, BEAT + VOCALS, SPOKEN VOICE, ACAPELLA SINGING,
+ *    and INSTRUMENTAL MELODIC to adapt DJ performance actions in real-time.
+ * 2. Intelligent 8-Beat Loop: On pure BEAT ONLY sections, executes seamless 2-cycle 8-beat DJ loops
+ *    synchronized to BPM without interrupting vocal phrases or jumping the main song player.
+ * 3. Speech-Aware Intelligent Crossfade: Detects spoken dialogue near the end of the song
+ *    (30-50s remaining) and smoothly starts crossfade before speech begins; falls back to standard
+ *    20-second crossfade if uncertain.
+ * 4. Single-Flanger Guarantee: Strictly allows no more than 1 Flanger performance per song.
+ * 5. Audio-Protective DJ Effects: Baby Scratch preserves original song volume; Echo & Decay delivers
+ *    tempo-synchronized delay repetitions with tape damping and natural decay.
+ * 6. Playlist Replay Variation: Uses lightweight history to favor different outcomes when replaying
+ *    the same playlist, avoiding repetitive effect sequences.
  */
 class SmartDjPerformanceEngine(
     private val context: Context,
@@ -39,6 +46,8 @@ class SmartDjPerformanceEngine(
         var hasTriggered: Boolean = false
     )
 
+    private val engineScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
     // Telemetry and active status for UI indicators
     private val _isDjEffectExecuting = MutableStateFlow(false)
     val isDjEffectExecuting: StateFlow<Boolean> = _isDjEffectExecuting.asStateFlow()
@@ -46,28 +55,50 @@ class SmartDjPerformanceEngine(
     private val _lastTriggeredEffectName = MutableStateFlow<String?>(null)
     val lastTriggeredEffectName: StateFlow<String?> = _lastTriggeredEffectName.asStateFlow()
 
+    // Real-Time Smart Music Awareness State
+    private val _currentClassification = MutableStateFlow(
+        SmartAudioClassifier.ClassificationResult(
+            type = SmartAudioClassifier.AudioContentType.UNCERTAIN,
+            confidence = 0.5f,
+            beatStrength = 0.5f,
+            vocalEnergy = 0.0f,
+            harmonicity = 0.0f,
+            speechCadence = 0.0f
+        )
+    )
+    val currentClassification: StateFlow<SmartAudioClassifier.ClassificationResult> = _currentClassification.asStateFlow()
+
+    private val _currentAudioContentType = MutableStateFlow(SmartAudioClassifier.AudioContentType.UNCERTAIN)
+    val currentAudioContentType: StateFlow<SmartAudioClassifier.AudioContentType> = _currentAudioContentType.asStateFlow()
+
+    // Callback when speech is detected near track end to initiate speech-aware crossfade
+    var onSpeechAwareCrossfadeRequested: (() -> Unit)? = null
+
     // Current track scheduling state
     private var currentTrack: MusicTrack? = null
     private var currentScheduledTrackId: Int? = null
     private var pendingMoment: ScheduledDjMoment? = null
     private var lastHandledPositionSec = -1
+    private var lastAnalysisSec = -1
     private var trackDurationSec = 180
     private var activeCrossfadeSec = 20
     private var activeCrossfadeEnabled = true
+
+    // Performance constraints
+    private var hasFlangerTriggeredForThisTrack = false
+    private var hasSpeechCrossfadeInitiatedForThisTrack = false
 
     /**
      * Estimates musical tempo (BPM) reliably for the given track.
      */
     fun estimateBpmForTrack(track: MusicTrack?): Double {
         if (track == null) return 124.0
-        // Stable, deterministic tempo estimation between 112 and 132 BPM
         val hash = (track.title.hashCode() xor track.artist.hashCode()).let { if (it < 0) -it else it }
         return 112.0 + (hash % 21)
     }
 
     /**
      * Called whenever a new track begins or is loaded.
-     * Song 1 and all subsequent songs are fully eligible for DJ performance.
      */
     @Synchronized
     fun onTrackStarted(
@@ -84,6 +115,12 @@ class SmartDjPerformanceEngine(
         activeCrossfadeSec = crossfadeSec
         activeCrossfadeEnabled = isCrossfadeEnabled
         lastHandledPositionSec = -1
+        lastAnalysisSec = -1
+        hasFlangerTriggeredForThisTrack = false
+        hasSpeechCrossfadeInitiatedForThisTrack = false
+
+        processor.smartAudioClassifier.reset()
+        _currentAudioContentType.value = SmartAudioClassifier.AudioContentType.UNCERTAIN
 
         if (!isDjEffectsEnabled) {
             pendingMoment = null
@@ -117,13 +154,10 @@ class SmartDjPerformanceEngine(
             val isCleanPlay = Random.nextFloat() < 0.28f
 
             if (isCleanPlay) {
-                // Record clean play in memory to encourage variation on replay
                 trackId?.let { history.recordCleanPlay(it) }
                 Log.d(TAG, "Track $trackId selected for clean intro play")
-                // Directly schedule mid-song moment instead
                 scheduleMidSongMoment(currentSec = targetSec + 4, crossfadeStartSec = crossfadeStartSec)
             } else {
-                // Independent scratch technique selection with memory
                 val lastTrackEffect = trackId?.let { history.getLastEffectForTrack(it) }
                 val lastGlobalEffect = history.getLastGlobalEffect()
 
@@ -144,12 +178,12 @@ class SmartDjPerformanceEngine(
             }
         } else if (currentSec < crossfadeStartSec - 18) {
             // ─────────────────────────────────────────────────────────────────
-            // 2. Mid-Song Moment: Genuine Flanger around middle of track
+            // 2. Mid-Song Moment: Flanger (max 1x) or 8-Beat Loop (on Beat Only)
             // ─────────────────────────────────────────────────────────────────
             scheduleMidSongMoment(currentSec, crossfadeStartSec)
         } else {
             // ─────────────────────────────────────────────────────────────────
-            // 3. Outro Moment: 6s prior to crossfade start (strictly aborts on CF)
+            // 3. Outro Moment: ~6s prior to crossfade start (strictly aborts on CF)
             // ─────────────────────────────────────────────────────────────────
             val outroSec = (crossfadeStartSec - 6).coerceAtLeast(currentSec + 2)
             if (outroSec < crossfadeStartSec - 3) {
@@ -169,11 +203,15 @@ class SmartDjPerformanceEngine(
         val triggerSec = midSec.coerceIn(currentSec + 5, (crossfadeStartSec - 12).coerceAtLeast(currentSec + 5))
 
         if (triggerSec < crossfadeStartSec - 8) {
-            val lastGlobalEffect = history.getLastGlobalEffect()
-            val chosenEffect = if (lastGlobalEffect == DjEffectType.FLANGER && Random.nextFloat() < 0.35f) {
-                DjEffectType.FILTER_SWEEP
-            } else {
-                DjEffectType.FLANGER
+            val awareness = _currentAudioContentType.value
+
+            // Selection adhering strictly to constraints:
+            // 1. If BEAT_ONLY is detected, prioritize 8-Beat Loop.
+            // 2. Flanger allowed NO MORE THAN ONCE per song.
+            val chosenEffect = when {
+                awareness == SmartAudioClassifier.AudioContentType.BEAT_ONLY -> DjEffectType.EIGHT_BEAT_LOOP
+                !hasFlangerTriggeredForThisTrack -> DjEffectType.FLANGER
+                else -> DjEffectType.FILTER_SWEEP
             }
 
             pendingMoment = ScheduledDjMoment(
@@ -181,7 +219,7 @@ class SmartDjPerformanceEngine(
                 triggerPositionSec = triggerSec,
                 hasTriggered = false
             )
-            Log.d(TAG, "Scheduled mid-song ${chosenEffect.displayName} at ${triggerSec}s")
+            Log.d(TAG, "Scheduled mid-song ${chosenEffect.displayName} at ${triggerSec}s (Awareness: ${awareness.displayName})")
         } else {
             pendingMoment = null
         }
@@ -228,6 +266,36 @@ class SmartDjPerformanceEngine(
             scheduleNextMoment(currentPosSec)
         }
 
+        // ─────────────────────────────────────────────────────────────────────
+        // Real-Time Smart Music Awareness Analysis (debounced every ~2 seconds)
+        // ─────────────────────────────────────────────────────────────────────
+        if (isPlaying && (lastAnalysisSec < 0 || kotlin.math.abs(currentPosSec - lastAnalysisSec) >= 2)) {
+            lastAnalysisSec = currentPosSec
+            runAudioAwarenessAnalysis(track, currentPosSec)
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Speech-Aware Intelligent Crossfade Check (30 to 50 seconds remaining)
+        // ─────────────────────────────────────────────────────────────────────
+        val remSec = trackDurationSec - currentPosSec
+        if (isPlaying && !hasSpeechCrossfadeInitiatedForThisTrack && !isCrossfading && remSec in 30..50) {
+            val classResult = _currentClassification.value
+            // Distinguish speech from melodic singing:
+            // Must be SPOKEN_VOICE with high confidence (>= 0.75) and NOT ACAPELLA_SINGING
+            if (classResult.type == SmartAudioClassifier.AudioContentType.SPOKEN_VOICE &&
+                classResult.confidence >= 0.75f &&
+                classResult.type != SmartAudioClassifier.AudioContentType.ACAPELLA_SINGING
+            ) {
+                hasSpeechCrossfadeInitiatedForThisTrack = true
+                Log.d(TAG, "Speech detected near end ($remSec s remaining). Initiating speech-aware crossfade.")
+                onSpeechAwareCrossfadeRequested?.invoke()
+                return
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Effect Execution Dispatch
+        // ─────────────────────────────────────────────────────────────────────
         val moment = pendingMoment ?: return
         if (moment.hasTriggered || processor.isEffectActive) {
             return
@@ -235,11 +303,35 @@ class SmartDjPerformanceEngine(
 
         // Trigger when reached or passed scheduled position
         if (isPlaying && currentPosSec >= moment.triggerPositionSec && currentPosSec <= moment.triggerPositionSec + 5) {
+            // Guard: Strict Flanger single-execution limit per song
+            if (moment.effectType == DjEffectType.FLANGER && hasFlangerTriggeredForThisTrack) {
+                Log.d(TAG, "Skipping repeated Flanger trigger for track ${track.id}; already performed once.")
+                moment.hasTriggered = true
+                scheduleNextMoment(currentPosSec + 4)
+                return
+            }
+
+            // Guard: Never perform 8-Beat Loop over singing or speech
+            val currentAwareness = _currentAudioContentType.value
+            if (moment.effectType == DjEffectType.EIGHT_BEAT_LOOP &&
+                (currentAwareness == SmartAudioClassifier.AudioContentType.BEAT_AND_VOCALS ||
+                 currentAwareness == SmartAudioClassifier.AudioContentType.SPOKEN_VOICE ||
+                 currentAwareness == SmartAudioClassifier.AudioContentType.ACAPELLA_SINGING)
+            ) {
+                Log.d(TAG, "Deferring 8-Beat Loop: vocal/speech content detected ($currentAwareness)")
+                moment.hasTriggered = true
+                scheduleNextMoment(currentPosSec + 5)
+                return
+            }
+
             moment.hasTriggered = true
+            if (moment.effectType == DjEffectType.FLANGER) {
+                hasFlangerTriggeredForThisTrack = true
+            }
+
             _isDjEffectExecuting.value = true
             _lastTriggeredEffectName.value = moment.effectType.displayName
 
-            // Record in history for replay variation
             history.recordEffect(track.id, moment.effectType)
 
             processor.triggerEffect(
@@ -255,7 +347,6 @@ class SmartDjPerformanceEngine(
                 onVolumeDuck = onVolumeDuck,
                 onComplete = {
                     _isDjEffectExecuting.value = false
-                    // Schedule next moment in this song if time permits
                     scheduleNextMoment(currentPosSec + 6)
                 }
             )
@@ -264,8 +355,31 @@ class SmartDjPerformanceEngine(
         lastHandledPositionSec = currentPosSec
     }
 
+    private fun runAudioAwarenessAnalysis(track: MusicTrack, currentPosSec: Int) {
+        engineScope.launch {
+            try {
+                val snippetPcm = if (track.contentUri.isNotBlank()) {
+                    processor.songAudioDecoder.extractAudioSnippet(
+                        contentUri = track.contentUri,
+                        startOffsetSec = currentPosSec,
+                        durationSec = 0.85,
+                        fallbackSeed = track.id + currentPosSec
+                    )
+                } else {
+                    processor.songAudioDecoder.extractAudioSnippet("", 0, 0.85, track.id + currentPosSec)
+                }
+
+                val result = processor.smartAudioClassifier.analyzePcm(snippetPcm)
+                _currentClassification.value = result
+                _currentAudioContentType.value = result.type
+            } catch (e: Throwable) {
+                Log.w(TAG, "Awareness analysis fallback: ${e.message}")
+            }
+        }
+    }
+
     /**
-     * Direct manual trigger from UI pads (e.g. tapping "Baby Scratch", "Flare Scratch", or "Flanger").
+     * Direct manual trigger from UI pads (e.g. tapping "Baby Scratch", "Flare Scratch", "Flanger", "8-Beat Loop").
      */
     @Synchronized
     fun triggerManualEffect(
@@ -279,6 +393,10 @@ class SmartDjPerformanceEngine(
         track: MusicTrack? = null,
         onVolumeDuck: ((Float) -> Unit)? = null
     ) {
+        if (effect == DjEffectType.FLANGER) {
+            hasFlangerTriggeredForThisTrack = true
+        }
+
         _isDjEffectExecuting.value = true
         _lastTriggeredEffectName.value = effect.displayName
         val activeTrack = track ?: currentTrack
@@ -328,6 +446,7 @@ class SmartDjPerformanceEngine(
 
     fun release() {
         cancelCurrentPerformance()
+        engineScope.cancel()
         processor.release()
     }
 }

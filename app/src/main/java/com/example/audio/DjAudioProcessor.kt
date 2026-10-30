@@ -46,6 +46,8 @@ class DjAudioProcessor(private val context: Context) {
     val turntableScratchEngine = TurntableScratchEngine(SAMPLE_RATE)
     val dspFlanger = DspFlanger(SAMPLE_RATE)
     val dspRhythmicEcho = DspRhythmicEcho(SAMPLE_RATE)
+    val dspEightBeatLoopEngine = DspEightBeatLoopEngine(SAMPLE_RATE)
+    val smartAudioClassifier = SmartAudioClassifier(SAMPLE_RATE)
 
     // Scratch audio storage
     private var scratchFiles = mutableListOf<File>()
@@ -169,7 +171,10 @@ class DjAudioProcessor(private val context: Context) {
                         executeRadioFilter(equalizer, baseEqGains, onVolumeDuck)
                     }
                     DjEffectType.ECHO_OUT -> {
-                        executeEchoOut(reverb, baseReverbPreset, equalizer, baseEqGains, estimatedBpm, onVolumeDuck)
+                        executeEchoOut(reverb, baseReverbPreset, equalizer, baseEqGains, estimatedBpm, track, onVolumeDuck)
+                    }
+                    DjEffectType.EIGHT_BEAT_LOOP -> {
+                        executeEightBeatLoop(track, estimatedBpm, onVolumeDuck)
                     }
                     DjEffectType.VINYL_SPIN_UP -> {
                         executeVinylSpinUp(mediaPlayer, basePitch, onVolumeDuck)
@@ -227,8 +232,8 @@ class DjAudioProcessor(private val context: Context) {
         pcmScratchIndex = 0
         pcmEffectMode = 1 // SCRATCH
 
-        // 3. Audible ducking of primary playback so scratches sound punchy, crisp, and prominent
-        onVolumeDuck?.invoke(0.20f)
+        // 3. Balanced layering of primary playback so scratches sound punchy without dropping song volume
+        onVolumeDuck?.invoke(0.85f)
 
         // 4. Play scratch performance via dedicated MediaPlayer
         withContext(Dispatchers.Main) {
@@ -253,9 +258,7 @@ class DjAudioProcessor(private val context: Context) {
         val durationMs = (renderedPcm.size * 1000L / SAMPLE_RATE).coerceIn(2400L, 5500L)
         delay(durationMs)
 
-        // 5. Smooth volume restoration to normal music playback
-        onVolumeDuck?.invoke(0.65f)
-        delay(60)
+        // 5. Smooth full volume restoration
         onVolumeDuck?.invoke(1.0f)
         pcmEffectMode = 0
     }
@@ -435,6 +438,8 @@ class DjAudioProcessor(private val context: Context) {
     // ─────────────────────────────────────────────────────────────────────────────
     // 6. Echo-Out
     // ─────────────────────────────────────────────────────────────────────────────
+    // 6. Echo-Out & Delay (Audible Tempo-Synced Tape Echo with Natural Decay Tail)
+    // ─────────────────────────────────────────────────────────────────────────────
 
     private suspend fun executeEchoOut(
         reverb: PresetReverb?,
@@ -442,6 +447,7 @@ class DjAudioProcessor(private val context: Context) {
         equalizer: Equalizer?,
         baseGains: FloatArray,
         estimatedBpm: Double,
+        track: MusicTrack?,
         onVolumeDuck: ((Float) -> Unit)?
     ) {
         pcmEffectMode = 5 // ECHO
@@ -453,7 +459,42 @@ class DjAudioProcessor(private val context: Context) {
             feedbackRatio = 0.52f
         )
 
-        // Set spatial acoustics on platform hardware reverb
+        // 1. Extract audio snippet from the actual song around current outro offset
+        val snippetPcm = if (track != null && track.contentUri.isNotBlank()) {
+            val offsetSec = (track.durationSec - 22).coerceAtLeast(10)
+            songAudioDecoder.extractAudioSnippet(track.contentUri, offsetSec, 2.5, track.id)
+        } else {
+            songAudioDecoder.extractAudioSnippet("", 0, 2.5, track?.id ?: 110)
+        }
+
+        // 2. Render authentic tempo-synchronized tape echo buffer with analog damping and decay tail
+        val renderedEchoPcm = dspRhythmicEcho.renderEchoBuffer(
+            sourcePcm = snippetPcm,
+            estimatedBpm = estimatedBpm,
+            division = DspRhythmicEcho.EchoDivision.DOTTED_EIGHTH
+        )
+        val tempWavFile = writeWavToFiles("dj_rhythmic_echo_perf.wav", renderedEchoPcm)
+
+        // 3. Play wet echo repetitions layered over advancing song without dropping main song volume
+        withContext(Dispatchers.Main) {
+            try {
+                scratchMediaPlayer?.release()
+                scratchMediaPlayer = MediaPlayer().apply {
+                    setDataSource(context, Uri.fromFile(tempWavFile))
+                    setVolume(0.85f, 0.85f)
+                    prepare()
+                    start()
+                    setOnCompletionListener { mp ->
+                        try { mp.release() } catch (_: Throwable) {}
+                        if (scratchMediaPlayer == mp) scratchMediaPlayer = null
+                    }
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "Echo player playback fallback: ${e.message}")
+            }
+        }
+
+        // 4. Set spatial acoustics on platform hardware reverb
         reverb?.let { rev ->
             try {
                 rev.preset = PresetReverb.PRESET_LARGEHALL
@@ -494,6 +535,56 @@ class DjAudioProcessor(private val context: Context) {
         dspRhythmicEcho.wetMix = 0.0f
         dspRhythmicEcho.reset()
         pcmEffectMode = 0
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // 7. Intelligent 8-Beat Rhythmic Loop Performance
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    private suspend fun executeEightBeatLoop(
+        track: MusicTrack?,
+        estimatedBpm: Double,
+        onVolumeDuck: ((Float) -> Unit)?
+    ) {
+        val loopDurationSec = dspEightBeatLoopEngine.calculateEightBeatDurationSec(estimatedBpm)
+        val snippetPcm = if (track != null && track.contentUri.isNotBlank()) {
+            val offsetSec = (track.durationSec * 0.45).toInt().coerceAtLeast(10)
+            songAudioDecoder.extractAudioSnippet(track.contentUri, offsetSec, loopDurationSec + 0.5, track.id)
+        } else {
+            songAudioDecoder.extractAudioSnippet("", 0, loopDurationSec + 0.5, track?.id ?: 120)
+        }
+
+        // Render 2 full repetitions with 10ms micro-crossfade seam smoothing
+        val renderedLoop = dspEightBeatLoopEngine.renderEightBeatLoop(
+            sourcePcm = snippetPcm,
+            estimatedBpm = estimatedBpm,
+            repeatCount = 2
+        )
+
+        val tempWavFile = writeWavToFiles("dj_eight_beat_loop_perf.wav", renderedLoop)
+
+        // Play loop performance cleanly layered via dedicated player
+        withContext(Dispatchers.Main) {
+            try {
+                scratchMediaPlayer?.release()
+                scratchMediaPlayer = MediaPlayer().apply {
+                    setDataSource(context, Uri.fromFile(tempWavFile))
+                    setVolume(1.0f, 1.0f)
+                    prepare()
+                    start()
+                    setOnCompletionListener { mp ->
+                        try { mp.release() } catch (_: Throwable) {}
+                        if (scratchMediaPlayer == mp) scratchMediaPlayer = null
+                    }
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "8-beat loop playback fallback: ${e.message}")
+            }
+        }
+
+        // Keep loop playing for its full 2-cycle duration without pausing or rewinding the main track
+        val totalDurationMs = (renderedLoop.size * 1000L / SAMPLE_RATE).coerceAtLeast(3000L)
+        delay(totalDurationMs)
     }
 
     // ─────────────────────────────────────────────────────────────────────────────

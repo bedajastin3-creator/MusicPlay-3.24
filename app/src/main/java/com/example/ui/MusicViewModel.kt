@@ -83,6 +83,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _isScanning = MutableStateFlow(false)
     val isScanning = _isScanning.asStateFlow()
 
+    val smartAudioContentType = playbackManager.smartAudioContentType
+
     init {
         playbackManager.setContext(application)
         viewModelScope.launch {

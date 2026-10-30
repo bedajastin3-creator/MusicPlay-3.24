@@ -106,4 +106,82 @@ class DspRhythmicEcho(private val sampleRate: Int = 22050) {
 
         return output.coerceIn(-1.0, 1.0)
     }
+
+    fun renderEchoBuffer(
+        sourcePcm: FloatArray,
+        estimatedBpm: Double = 120.0,
+        division: EchoDivision = EchoDivision.DOTTED_EIGHTH
+    ): ShortArray {
+        val shorts = ShortArray(sourcePcm.size) { i ->
+            (sourcePcm[i].coerceIn(-1.0f, 1.0f) * 32767.0f).toInt().toShort()
+        }
+        return renderEchoBuffer(shorts, estimatedBpm, division)
+    }
+
+    /**
+     * Renders a dedicated wet echo/delay buffer from a song audio snippet.
+     * Generates tempo-synchronized delayed repetitions with analog tape damping
+     * and a natural acoustic decay tail, ready for layered playback alongside the main track.
+     */
+    fun renderEchoBuffer(
+        sourcePcm: ShortArray,
+        estimatedBpm: Double = 120.0,
+        division: EchoDivision = EchoDivision.DOTTED_EIGHTH
+    ): ShortArray {
+        reset()
+        configureTempo(estimatedBpm, division, feedbackRatio = 0.52f)
+
+        // Extra tail duration for natural acoustic dissipation (~1.8 seconds)
+        val tailSamples = (sampleRate * 1.8).toInt()
+        val totalSamples = sourcePcm.size + tailSamples
+        val outputPcm = ShortArray(totalSamples)
+
+        // Wet mix automation: ramp up wet mix during source, then let tail decay naturally
+        for (i in 0 until totalSamples) {
+            val inputSample = if (i < sourcePcm.size) {
+                sourcePcm[i] / 32768.0
+            } else {
+                0.0
+            }
+
+            if (i < sourcePcm.size) {
+                isInputMuted = false
+                val rampProgress = (i.toFloat() / (sourcePcm.size * 0.35f)).coerceIn(0f, 1f)
+                wetMix = 0.30f + (0.45f * rampProgress)
+            } else {
+                isInputMuted = true
+                val tailIndex = i - sourcePcm.size
+                val decayProgress = (tailIndex.toFloat() / tailSamples.toFloat()).coerceIn(0f, 1f)
+                wetMix = 0.75f * (1.0f - decayProgress)
+            }
+
+            // We want ONLY the delayed/wet repetitions in this buffer so it layers cleanly
+            // over the main playing song without double-amplifying the dry signal
+            var readIndex = writeIndex - currentDelaySamples
+            if (readIndex < 0) {
+                readIndex += MAX_DELAY_SAMPLES
+            }
+            val rawDelayed = delayBuffer[readIndex].toDouble()
+
+            val dampingAlpha = 0.55
+            dampingState += dampingAlpha * (rawDelayed - dampingState)
+            val filteredDelayed = dampingState
+
+            val saturatedDelayed = tanh(filteredDelayed * 1.10).toFloat()
+            val toWrite = if (!isInputMuted) {
+                (inputSample.toFloat() + (saturatedDelayed * feedback)).coerceIn(-1.5f, 1.5f)
+            } else {
+                (saturatedDelayed * feedback).coerceIn(-1.5f, 1.5f)
+            }
+            delayBuffer[writeIndex] = toWrite
+            writeIndex = (writeIndex + 1) % MAX_DELAY_SAMPLES
+
+            val wetVal = (filteredDelayed * wetMix).coerceIn(-1.0, 1.0)
+            outputPcm[i] = (wetVal * 32767.0).toInt().coerceIn(-32768, 32767).toShort()
+        }
+
+        reset()
+        return outputPcm
+    }
 }
+
