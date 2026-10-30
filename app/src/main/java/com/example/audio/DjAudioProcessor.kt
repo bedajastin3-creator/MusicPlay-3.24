@@ -45,8 +45,6 @@ class DjAudioProcessor(private val context: Context) {
     val songAudioDecoder = SongAudioDecoder(context)
     val turntableScratchEngine = TurntableScratchEngine(SAMPLE_RATE)
     val dspFlanger = DspFlanger(SAMPLE_RATE)
-    val dspRhythmicEcho = DspRhythmicEcho(SAMPLE_RATE)
-    val dspEightBeatLoopEngine = DspEightBeatLoopEngine(SAMPLE_RATE)
     val smartAudioClassifier = SmartAudioClassifier(SAMPLE_RATE)
 
     // Scratch audio storage
@@ -71,7 +69,7 @@ class DjAudioProcessor(private val context: Context) {
     // Real-Time PCM DSP State (Used directly in AudioTrack synthesis loop)
     // ─────────────────────────────────────────────────────────────────────────────
     @Volatile
-    private var pcmEffectMode: Int = 0 // 0: bypass, 1: scratch, 2: filter sweep, 3: beat filter, 4: radio, 5: echo, 6: spinup, 7: flanger
+    private var pcmEffectMode: Int = 0 // 0: bypass, 1: scratch, 2: filter sweep, 3: beat filter, 4: radio, 6: spinup, 7: flanger
     @Volatile
     private var pcmCurrentScratch: ShortArray? = null
     @Volatile
@@ -87,15 +85,6 @@ class DjAudioProcessor(private val context: Context) {
     // Beat Filter State
     @Volatile
     private var pcmBeatFilterPulse = 0.0 // 0.0 to 1.0
-
-    // Echo Ring Buffer (280ms circular delay line)
-    private val echoDelaySamples = (SAMPLE_RATE * 0.28).toInt()
-    private val echoBuffer = FloatArray(echoDelaySamples)
-    private var echoBufferIndex = 0
-    @Volatile
-    private var echoMixLevel = 0.0f
-    @Volatile
-    private var echoFeedback = 0.55f
 
     // Spin-Up State
     @Volatile
@@ -170,12 +159,6 @@ class DjAudioProcessor(private val context: Context) {
                     DjEffectType.RADIO_FILTER -> {
                         executeRadioFilter(equalizer, baseEqGains, onVolumeDuck)
                     }
-                    DjEffectType.ECHO_OUT -> {
-                        executeEchoOut(reverb, baseReverbPreset, equalizer, baseEqGains, estimatedBpm, track, onVolumeDuck)
-                    }
-                    DjEffectType.EIGHT_BEAT_LOOP -> {
-                        executeEightBeatLoop(track, estimatedBpm, onVolumeDuck)
-                    }
                     DjEffectType.VINYL_SPIN_UP -> {
                         executeVinylSpinUp(mediaPlayer, basePitch, onVolumeDuck)
                     }
@@ -232,8 +215,8 @@ class DjAudioProcessor(private val context: Context) {
         pcmScratchIndex = 0
         pcmEffectMode = 1 // SCRATCH
 
-        // 3. Balanced layering of primary playback so scratches sound punchy without dropping song volume
-        onVolumeDuck?.invoke(0.85f)
+        // 3. Balanced layering of primary playback so scratches sound loud, clear, and punchy
+        onVolumeDuck?.invoke(0.80f)
 
         // 4. Play scratch performance via dedicated MediaPlayer
         withContext(Dispatchers.Main) {
@@ -435,157 +418,7 @@ class DjAudioProcessor(private val context: Context) {
         pcmEffectMode = 0
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // 6. Echo-Out
-    // ─────────────────────────────────────────────────────────────────────────────
-    // 6. Echo-Out & Delay (Audible Tempo-Synced Tape Echo with Natural Decay Tail)
-    // ─────────────────────────────────────────────────────────────────────────────
 
-    private suspend fun executeEchoOut(
-        reverb: PresetReverb?,
-        basePreset: String,
-        equalizer: Equalizer?,
-        baseGains: FloatArray,
-        estimatedBpm: Double,
-        track: MusicTrack?,
-        onVolumeDuck: ((Float) -> Unit)?
-    ) {
-        pcmEffectMode = 5 // ECHO
-        dspRhythmicEcho.reset()
-        // Musical interval: Dotted 1/8 note synchronized to tempo with controlled 0.52 feedback
-        dspRhythmicEcho.configureTempo(
-            estimatedBpm = estimatedBpm,
-            division = DspRhythmicEcho.EchoDivision.DOTTED_EIGHTH,
-            feedbackRatio = 0.52f
-        )
-
-        // 1. Extract audio snippet from the actual song around current outro offset
-        val snippetPcm = if (track != null && track.contentUri.isNotBlank()) {
-            val offsetSec = (track.durationSec - 22).coerceAtLeast(10)
-            songAudioDecoder.extractAudioSnippet(track.contentUri, offsetSec, 2.5, track.id)
-        } else {
-            songAudioDecoder.extractAudioSnippet("", 0, 2.5, track?.id ?: 110)
-        }
-
-        // 2. Render authentic tempo-synchronized tape echo buffer with analog damping and decay tail
-        val renderedEchoPcm = dspRhythmicEcho.renderEchoBuffer(
-            sourcePcm = snippetPcm,
-            estimatedBpm = estimatedBpm,
-            division = DspRhythmicEcho.EchoDivision.DOTTED_EIGHTH
-        )
-        val tempWavFile = writeWavToFiles("dj_rhythmic_echo_perf.wav", renderedEchoPcm)
-
-        // 3. Play wet echo repetitions layered over advancing song without dropping main song volume
-        withContext(Dispatchers.Main) {
-            try {
-                scratchMediaPlayer?.release()
-                scratchMediaPlayer = MediaPlayer().apply {
-                    setDataSource(context, Uri.fromFile(tempWavFile))
-                    setVolume(0.85f, 0.85f)
-                    prepare()
-                    start()
-                    setOnCompletionListener { mp ->
-                        try { mp.release() } catch (_: Throwable) {}
-                        if (scratchMediaPlayer == mp) scratchMediaPlayer = null
-                    }
-                }
-            } catch (e: Throwable) {
-                Log.w(TAG, "Echo player playback fallback: ${e.message}")
-            }
-        }
-
-        // 4. Set spatial acoustics on platform hardware reverb
-        reverb?.let { rev ->
-            try {
-                rev.preset = PresetReverb.PRESET_LARGEHALL
-            } catch (_: Throwable) {}
-        }
-
-        // Phase 1: Smooth Wet Ramp-In & Rhythmic Echo Capture (~1.4 seconds)
-        val captureSteps = 18
-        for (i in 1..captureSteps) {
-            val wet = (i.toFloat() / captureSteps) * 0.65f
-            dspRhythmicEcho.wetMix = wet
-            equalizer?.let { eq ->
-                try {
-                    val numBands = min(eq.numberOfBands.toInt(), baseGains.size)
-                    val range = eq.bandLevelRange
-                    for (b in 0 until numBands) {
-                        // Gentle high-shelf roll-off during echo to emphasize warm analog tape repeats
-                        val dbOffset = if (b >= numBands - 2) -4.0f * (wet / 0.65f) else 1.5f * (wet / 0.65f)
-                        val mb = ((baseGains[b] + dbOffset) * 100).toInt().coerceIn(range[0].toInt(), range[1].toInt()).toShort()
-                        eq.setBandLevel(b.toShort(), mb)
-                    }
-                } catch (_: Throwable) {}
-            }
-            delay(80)
-        }
-
-        // Phase 2: Natural Tail Decay (~2.2 seconds)
-        // Mute new input into delay line: existing echo repetitions decay naturally into silence
-        // without harsh cutoffs, clipping, or interfering with incoming playback
-        dspRhythmicEcho.isInputMuted = true
-        val decaySteps = 22
-        for (i in decaySteps downTo 1) {
-            val wet = (i.toFloat() / decaySteps) * 0.65f
-            dspRhythmicEcho.wetMix = wet
-            delay(100)
-        }
-
-        dspRhythmicEcho.wetMix = 0.0f
-        dspRhythmicEcho.reset()
-        pcmEffectMode = 0
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────────
-    // 7. Intelligent 8-Beat Rhythmic Loop Performance
-    // ─────────────────────────────────────────────────────────────────────────────
-
-    private suspend fun executeEightBeatLoop(
-        track: MusicTrack?,
-        estimatedBpm: Double,
-        onVolumeDuck: ((Float) -> Unit)?
-    ) {
-        val loopDurationSec = dspEightBeatLoopEngine.calculateEightBeatDurationSec(estimatedBpm)
-        val snippetPcm = if (track != null && track.contentUri.isNotBlank()) {
-            val offsetSec = (track.durationSec * 0.45).toInt().coerceAtLeast(10)
-            songAudioDecoder.extractAudioSnippet(track.contentUri, offsetSec, loopDurationSec + 0.5, track.id)
-        } else {
-            songAudioDecoder.extractAudioSnippet("", 0, loopDurationSec + 0.5, track?.id ?: 120)
-        }
-
-        // Render 2 full repetitions with 10ms micro-crossfade seam smoothing
-        val renderedLoop = dspEightBeatLoopEngine.renderEightBeatLoop(
-            sourcePcm = snippetPcm,
-            estimatedBpm = estimatedBpm,
-            repeatCount = 2
-        )
-
-        val tempWavFile = writeWavToFiles("dj_eight_beat_loop_perf.wav", renderedLoop)
-
-        // Play loop performance cleanly layered via dedicated player
-        withContext(Dispatchers.Main) {
-            try {
-                scratchMediaPlayer?.release()
-                scratchMediaPlayer = MediaPlayer().apply {
-                    setDataSource(context, Uri.fromFile(tempWavFile))
-                    setVolume(1.0f, 1.0f)
-                    prepare()
-                    start()
-                    setOnCompletionListener { mp ->
-                        try { mp.release() } catch (_: Throwable) {}
-                        if (scratchMediaPlayer == mp) scratchMediaPlayer = null
-                    }
-                }
-            } catch (e: Throwable) {
-                Log.w(TAG, "8-beat loop playback fallback: ${e.message}")
-            }
-        }
-
-        // Keep loop playing for its full 2-cycle duration without pausing or rewinding the main track
-        val totalDurationMs = (renderedLoop.size * 1000L / SAMPLE_RATE).coerceAtLeast(3000L)
-        delay(totalDurationMs)
-    }
 
     // ─────────────────────────────────────────────────────────────────────────────
     // 7. Vinyl Spin-Up
@@ -662,10 +495,6 @@ class DjAudioProcessor(private val context: Context) {
                 val band = svfBand * 2.2
                 sample = tanh(band * 1.4) * 0.90
             }
-            5 -> {
-                // RHYTHMIC TAPE ECHO (DspRhythmicEcho)
-                sample = dspRhythmicEcho.processSample(sample)
-            }
             6 -> {
                 // SPIN UP
                 sample *= spinUpProgress
@@ -697,8 +526,6 @@ class DjAudioProcessor(private val context: Context) {
         pcmEffectMode = 0
         dspFlanger.wetMix = 0f
         dspFlanger.reset()
-        dspRhythmicEcho.wetMix = 0f
-        dspRhythmicEcho.reset()
         restoreBaseAudioStates(equalizer, reverb, baseEqGains, baseReverbPreset, mediaPlayer, basePitch, onVolumeDuck)
         isEffectActive = false
         activeEffectType = null
@@ -767,7 +594,6 @@ class DjAudioProcessor(private val context: Context) {
         } catch (_: Throwable) {}
         scratchMediaPlayer = null
         dspFlanger.reset()
-        dspRhythmicEcho.reset()
         songAudioDecoder.clearCache()
     }
 

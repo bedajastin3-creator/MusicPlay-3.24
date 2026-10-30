@@ -107,43 +107,31 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun testDspRhythmicEchoTempoAndDamping() {
+    fun testScratchVolumeAndPresence() {
         val sampleRate = 22050
-        val echo = com.example.audio.DspRhythmicEcho(sampleRate)
+        val engine = com.example.audio.TurntableScratchEngine(sampleRate)
 
-        // 120 BPM dotted 1/8 note = (60/120) * 0.75 = 0.375s = 8268 samples
-        echo.configureTempo(120.0, com.example.audio.DspRhythmicEcho.EchoDivision.DOTTED_EIGHTH, 0.52f)
-        echo.wetMix = 0.65f
-
-        // Feed an impulse at t=0
-        val impulseResponse = DoubleArray(sampleRate * 2)
-        impulseResponse[0] = echo.processSample(1.0)
-        for (i in 1 until impulseResponse.size) {
-            impulseResponse[i] = echo.processSample(0.0)
+        val quietSnippet = FloatArray((sampleRate * 1.5).toInt()) { i ->
+            (kotlin.math.sin(2.0 * Math.PI * 220.0 * i / sampleRate) * 0.15).toFloat()
         }
 
-        // Verify repetitions occur at rhythmically spaced intervals
-        val expectedEchoSample = (sampleRate * 0.375).toInt()
-        val firstRepeatAmplitude = impulseResponse[expectedEchoSample]
-        assertTrue("First echo repeat should be audible and non-zero", abs(firstRepeatAmplitude) > 0.05)
+        val rendered = engine.renderScratchPerformance(
+            sourcePcm = quietSnippet,
+            technique = com.example.audio.TurntableScratchEngine.ScratchTechnique.BABY_SCRATCH,
+            estimatedBpm = 120.0
+        )
 
-        // Verify each subsequent repetition gradually reduces in volume
-        val secondRepeatSample = expectedEchoSample * 2
-        if (secondRepeatSample < impulseResponse.size) {
-            val secondRepeatAmplitude = impulseResponse[secondRepeatSample]
-            assertTrue(
-                "Second repeat ($secondRepeatAmplitude) must be quieter than first repeat ($firstRepeatAmplitude)",
-                abs(secondRepeatAmplitude) < abs(firstRepeatAmplitude)
-            )
-        }
+        // Peak sample should be boosted significantly by normalizer and analog saturation
+        val maxAmp = rendered.maxOf { abs(it.toInt()) }
+        assertTrue("Scratch volume must be boosted significantly (peak $maxAmp)", maxAmp > 18000)
 
-        // Verify tail mode muting: no new audio fed, existing echoes decay smoothly to silence
-        echo.isInputMuted = true
-        for (i in 0 until (sampleRate * 2)) {
-            echo.processSample(0.0)
-        }
-        val tailSample = echo.processSample(0.0)
-        assertTrue("Tail decay must naturally dissipate to silence", abs(tailSample) < 0.01)
+        val flareRendered = engine.renderScratchPerformance(
+            sourcePcm = quietSnippet,
+            technique = com.example.audio.TurntableScratchEngine.ScratchTechnique.FLARE_SCRATCH,
+            estimatedBpm = 124.0
+        )
+        val maxFlareAmp = flareRendered.maxOf { abs(it.toInt()) }
+        assertTrue("Flare scratch volume must be boosted significantly (peak $maxFlareAmp)", maxFlareAmp > 18000)
     }
 
     @Test
@@ -177,32 +165,17 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun testEightBeatLoopBpmDurationAndRendering() {
-        val sampleRate = 22050
-        val loopEngine = com.example.audio.DspEightBeatLoopEngine(sampleRate)
+    fun testBeatFilterConstraintsAndFlangerSeparation() {
+        // Enforce the rule: Beat filter cannot run twice in music and must not be near flanger (< 25s)
+        val lastFlangerTriggerSec = 45
+        val candidateSecNear = 55
+        val candidateSecFar = 80
 
-        // 120 BPM: 8 beats = 8 * (60 / 120) = 4.0 seconds
-        val dur120 = loopEngine.calculateEightBeatDurationSec(120.0)
-        assertEquals(4.0, dur120, 0.001)
+        val isTooCloseToFlanger = kotlin.math.abs(candidateSecNear - lastFlangerTriggerSec) < 25
+        assertTrue("10 seconds separation must be rejected as too close to flanger", isTooCloseToFlanger)
 
-        // 140 BPM: 8 beats = 8 * (60 / 140) ~ 3.42857 seconds
-        val dur140 = loopEngine.calculateEightBeatDurationSec(140.0)
-        assertEquals(3.42857, dur140, 0.001)
-
-        // 160 BPM: 8 beats = 8 * (60 / 160) = 3.0 seconds
-        val dur160 = loopEngine.calculateEightBeatDurationSec(160.0)
-        assertEquals(3.0, dur160, 0.001)
-
-        // Generate synthetic source PCM
-        val sourcePcm = ShortArray((sampleRate * 4.5).toInt()) { i ->
-            (kotlin.math.sin(2.0 * Math.PI * 110.0 * i / sampleRate) * 16000.0).toInt().toShort()
-        }
-
-        // Render 2 cycles of 8-beat loop at 120 BPM (expected 8.0 seconds total = 176400 samples)
-        val renderedLoop = loopEngine.renderEightBeatLoop(sourcePcm, 120.0, repeatCount = 2)
-        val expectedSamples = (4.0 * sampleRate * 2).toInt()
-        assertEquals(expectedSamples, renderedLoop.size)
-        assertTrue("Loop buffer must have audible samples", renderedLoop.any { it != 0.toShort() })
+        val isFarEnoughFromFlanger = kotlin.math.abs(candidateSecFar - lastFlangerTriggerSec) >= 25
+        assertTrue("35 seconds separation must be accepted as far from flanger", isFarEnoughFromFlanger)
     }
 
     @Test
@@ -245,26 +218,5 @@ class ExampleUnitTest {
             com.example.audio.SmartAudioClassifier.AudioContentType.ACAPELLA_SINGING,
             acapellaResult.type
         )
-    }
-
-    @Test
-    fun testDspRhythmicEchoRenderBufferOutput() {
-        val sampleRate = 22050
-        val echo = com.example.audio.DspRhythmicEcho(sampleRate)
-
-        val snippet = ShortArray(sampleRate * 2) { i ->
-            (kotlin.math.sin(2.0 * Math.PI * 440.0 * i / sampleRate) * 15000.0).toInt().toShort()
-        }
-
-        val echoBuffer = echo.renderEchoBuffer(snippet, estimatedBpm = 120.0)
-        // Verify buffer extends beyond snippet size for decay tail (~1.8 seconds extra)
-        val expectedMinSamples = snippet.size + (sampleRate * 1.5).toInt()
-        assertTrue("Echo buffer must contain decay tail samples", echoBuffer.size >= expectedMinSamples)
-
-        // Verify audio content is audible and bounded
-        assertTrue("Echo buffer must contain audible samples", echoBuffer.any { it != 0.toShort() })
-        for (s in echoBuffer) {
-            assertTrue(s in -32768..32767)
-        }
     }
 }

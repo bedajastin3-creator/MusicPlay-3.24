@@ -118,10 +118,19 @@ class TurntableScratchEngine(private val sampleRate: Int = 22050) {
         // Anchor position inside source buffer (moves slightly between movements for realism)
         val baseAnchor = (sourceLen * 0.20 + (movementIndex % 4) * (sourceLen * 0.08)).toInt().coerceIn(0, sourceLen - maxTravelSamples - 10)
 
+        // Dynamic gain normalization: boost input audio snippet to full presence so scratches sound loud and prominent
+        var maxAmp = 0.001f
+        for (s in sourcePcm) {
+            val a = abs(s)
+            if (a > maxAmp) maxAmp = a
+        }
+        val normalizer = (0.95f / maxAmp).coerceIn(1.35f, 3.8f)
+
         // 2-pole filter states for warm low-mid shaping and high-frequency control
         var svfLow = 0.0
         var svfBand = 0.0
-        var prevRawSample = 0.0
+        var prevWarmSample = 0.0
+        var dcBlockerState = 0.0
 
         for (i in 0 until durationSamples) {
             val isForward = (i < halfDuration)
@@ -141,11 +150,11 @@ class TurntableScratchEngine(private val sampleRate: Int = 22050) {
 
             val readPos = (baseAnchor + travel).coerceIn(0.0, (sourceLen - 2).toDouble())
 
-            // 2. High-precision fractional linear interpolation
+            // 2. High-precision fractional linear interpolation with volume normalization boost
             val idx0 = readPos.toInt()
             val idx1 = (idx0 + 1).coerceAtMost(sourceLen - 1)
             val frac = (readPos - idx0).toFloat()
-            val rawSample = (sourcePcm[idx0] * (1f - frac) + sourcePcm[idx1] * frac).toDouble()
+            val rawSample = ((sourcePcm[idx0] * (1f - frac) + sourcePcm[idx1] * frac) * normalizer).toDouble()
 
             // 3. Tonal Frequency Shaping: Warm Low-Mids & Harsh-High Taming
             // Low-pass cutoff sweeps between 1600 Hz and 2200 Hz with needle velocity (never allowed to spike up)
@@ -159,12 +168,13 @@ class TurntableScratchEngine(private val sampleRate: Int = 22050) {
             svfLow += svfBand * f
 
             // Low-mid warmth shelf: Mix bandpass & lowpass for heavy, punchy turntable presence
-            val warmShaped = (svfLow * 1.05) + (svfBand * 0.35)
+            val warmShaped = (svfLow * 1.20) + (svfBand * 0.45)
 
-            // High-pass rumble filter (50 Hz) prevents DC offset or muddy speaker flap
-            val rumbleFilterAlpha = 0.985
-            val hpSample = warmShaped - prevRawSample + (rumbleFilterAlpha * 0.0)
-            prevRawSample = warmShaped
+            // High-pass rumble filter (DC blocker at ~35 Hz) prevents speaker flap while preserving full bass body
+            val dcBlockerAlpha = 0.990
+            val hpSample = warmShaped - prevWarmSample + (dcBlockerAlpha * dcBlockerState)
+            prevWarmSample = warmShaped
+            dcBlockerState = hpSample
 
             // Subtle magnetic cartridge warmth & needle drag friction (low-frequency vinyl weight)
             val vinylFriction = (sin(i.toDouble() * 0.04) * 0.015) * velNorm
@@ -186,9 +196,9 @@ class TurntableScratchEngine(private val sampleRate: Int = 22050) {
 
             processed *= faderGate
 
-            // 5. Analog DJ mixer magnetic cartridge saturation (warm second harmonic warmth, no digital clipping)
-            val warmSaturated = tanh(processed * 1.35) * 0.94
-            out[i] = (warmSaturated * 31500.0).toInt().coerceIn(-32768, 32767).toShort()
+            // 5. Analog DJ mixer magnetic cartridge saturation: punchy, warm, loud volume without clipping
+            val warmSaturated = tanh(processed * 1.65) * 0.98
+            out[i] = (warmSaturated * 32767.0).toInt().coerceIn(-32768, 32767).toShort()
         }
 
         return out

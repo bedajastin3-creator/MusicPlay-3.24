@@ -45,16 +45,6 @@ enum class DjEffectType(
         description = "Vintage bandpass filter emphasizing mid-range frequencies",
         preferredSection = DjSection.MID_SONG
     ),
-    ECHO_OUT(
-        displayName = "Echo & Decay",
-        description = "Atmospheric spatial echo with natural acoustic tail decay",
-        preferredSection = DjSection.TRANSITION_OR_BREAK
-    ),
-    EIGHT_BEAT_LOOP(
-        displayName = "8-Beat Loop",
-        description = "Intelligent DJ 8-beat rhythmic loop on instrumental beat sections",
-        preferredSection = DjSection.MID_SONG
-    ),
     VINYL_SPIN_UP(
         displayName = "Vinyl Spin-Up",
         description = "Subtle turntable startup speed ramp at the beginning of a track",

@@ -3737,11 +3737,9 @@ fun DjEffectPads(
     val effects = listOf(
         Triple(DjEffectType.BABY_SCRATCH, "Baby Scratch", Icons.Filled.Refresh),
         Triple(DjEffectType.FLARE_SCRATCH, "Flare Scratch", Icons.Filled.Speed),
-        Triple(DjEffectType.EIGHT_BEAT_LOOP, "8-Beat Loop", Icons.Filled.Loop),
         Triple(DjEffectType.FLANGER, "Flanger", Icons.Filled.AutoAwesome),
         Triple(DjEffectType.FILTER_SWEEP, "Filter Sweep", Icons.Filled.Tune),
-        Triple(DjEffectType.BEAT_FILTER, "Beat Filter", Icons.Filled.PlayArrow),
-        Triple(DjEffectType.ECHO_OUT, "Echo & Decay", Icons.Filled.GraphicEq)
+        Triple(DjEffectType.BEAT_FILTER, "Beat Filter", Icons.Filled.PlayArrow)
     )
 
     Column(modifier = modifier.fillMaxWidth()) {

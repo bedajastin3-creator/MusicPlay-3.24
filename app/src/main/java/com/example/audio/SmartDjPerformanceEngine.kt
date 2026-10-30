@@ -86,7 +86,11 @@ class SmartDjPerformanceEngine(
 
     // Performance constraints
     private var hasFlangerTriggeredForThisTrack = false
+    private var hasBeatFilterTriggeredForThisTrack = false
+    private var lastFlangerTriggerSec = -1
+    private var lastBeatFilterTriggerSec = -1
     private var hasSpeechCrossfadeInitiatedForThisTrack = false
+    private var lastAnalysisTimestampMs = 0L
 
     /**
      * Estimates musical tempo (BPM) reliably for the given track.
@@ -117,7 +121,11 @@ class SmartDjPerformanceEngine(
         lastHandledPositionSec = -1
         lastAnalysisSec = -1
         hasFlangerTriggeredForThisTrack = false
+        hasBeatFilterTriggeredForThisTrack = false
+        lastFlangerTriggerSec = -1
+        lastBeatFilterTriggerSec = -1
         hasSpeechCrossfadeInitiatedForThisTrack = false
+        lastAnalysisTimestampMs = 0L
 
         processor.smartAudioClassifier.reset()
         _currentAudioContentType.value = SmartAudioClassifier.AudioContentType.UNCERTAIN
@@ -178,20 +186,32 @@ class SmartDjPerformanceEngine(
             }
         } else if (currentSec < crossfadeStartSec - 18) {
             // ─────────────────────────────────────────────────────────────────
-            // 2. Mid-Song Moment: Flanger (max 1x) or 8-Beat Loop (on Beat Only)
+            // 2. Mid-Song Moment: Flanger (max 1x) or Filter Sweep
             // ─────────────────────────────────────────────────────────────────
             scheduleMidSongMoment(currentSec, crossfadeStartSec)
         } else {
             // ─────────────────────────────────────────────────────────────────
-            // 3. Outro Moment: ~6s prior to crossfade start (strictly aborts on CF)
+            // 3. Outro Moment: ~6s prior to crossfade start (near crossfade)
             // ─────────────────────────────────────────────────────────────────
             val outroSec = (crossfadeStartSec - 6).coerceAtLeast(currentSec + 2)
             if (outroSec < crossfadeStartSec - 3) {
+                // Choose between Beat Filter and Turntable Scratch near crossfade
+                // Rule: Never use Beat Filter twice in music and do not place it near Flanger (>= 25s apart)
+                val canUseBeatFilter = !hasBeatFilterTriggeredForThisTrack &&
+                    (lastFlangerTriggerSec < 0 || kotlin.math.abs(outroSec - lastFlangerTriggerSec) >= 25)
+
+                val chosenOutroEffect = if (canUseBeatFilter && Random.nextBoolean()) {
+                    DjEffectType.BEAT_FILTER
+                } else {
+                    if (Random.nextBoolean()) DjEffectType.BABY_SCRATCH else DjEffectType.FLARE_SCRATCH
+                }
+
                 pendingMoment = ScheduledDjMoment(
-                    effectType = DjEffectType.ECHO_OUT,
+                    effectType = chosenOutroEffect,
                     triggerPositionSec = outroSec,
                     hasTriggered = false
                 )
+                Log.d(TAG, "Scheduled outro ${chosenOutroEffect.displayName} near crossfade at ${outroSec}s")
             } else {
                 pendingMoment = null
             }
@@ -206,11 +226,14 @@ class SmartDjPerformanceEngine(
             val awareness = _currentAudioContentType.value
 
             // Selection adhering strictly to constraints:
-            // 1. If BEAT_ONLY is detected, prioritize 8-Beat Loop.
-            // 2. Flanger allowed NO MORE THAN ONCE per song.
+            // 1. Flanger allowed NO MORE THAN ONCE per song.
+            // 2. Beat Filter allowed NO MORE THAN ONCE per song, and NEVER near Flanger (>= 25s apart).
+            val canUseBeatFilter = !hasBeatFilterTriggeredForThisTrack &&
+                (lastFlangerTriggerSec < 0 || kotlin.math.abs(triggerSec - lastFlangerTriggerSec) >= 25)
+
             val chosenEffect = when {
-                awareness == SmartAudioClassifier.AudioContentType.BEAT_ONLY -> DjEffectType.EIGHT_BEAT_LOOP
                 !hasFlangerTriggeredForThisTrack -> DjEffectType.FLANGER
+                canUseBeatFilter && Random.nextBoolean() -> DjEffectType.BEAT_FILTER
                 else -> DjEffectType.FILTER_SWEEP
             }
 
@@ -267,27 +290,27 @@ class SmartDjPerformanceEngine(
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Real-Time Smart Music Awareness Analysis (debounced every ~2 seconds)
+        // Real-Time Smart Music Awareness Analysis (fast detection every ~600ms)
         // ─────────────────────────────────────────────────────────────────────
-        if (isPlaying && (lastAnalysisSec < 0 || kotlin.math.abs(currentPosSec - lastAnalysisSec) >= 2)) {
+        val nowMs = System.currentTimeMillis()
+        if (isPlaying && (nowMs - lastAnalysisTimestampMs >= 600L)) {
+            lastAnalysisTimestampMs = nowMs
             lastAnalysisSec = currentPosSec
-            runAudioAwarenessAnalysis(track, currentPosSec)
+            runAudioAwarenessAnalysis(track, currentPosSec, isPlaying, isCrossfading)
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Speech-Aware Intelligent Crossfade Check (30 to 50 seconds remaining)
+        // Speech-Aware Intelligent Crossfade Check: Immediate Crossfade!
         // ─────────────────────────────────────────────────────────────────────
         val remSec = trackDurationSec - currentPosSec
-        if (isPlaying && !hasSpeechCrossfadeInitiatedForThisTrack && !isCrossfading && remSec in 30..50) {
+        if (isPlaying && !hasSpeechCrossfadeInitiatedForThisTrack && !isCrossfading && remSec <= 75 && currentPosSec >= 12) {
             val classResult = _currentClassification.value
-            // Distinguish speech from melodic singing:
-            // Must be SPOKEN_VOICE with high confidence (>= 0.75) and NOT ACAPELLA_SINGING
-            if (classResult.type == SmartAudioClassifier.AudioContentType.SPOKEN_VOICE &&
-                classResult.confidence >= 0.75f &&
-                classResult.type != SmartAudioClassifier.AudioContentType.ACAPELLA_SINGING
-            ) {
+            val isSpokenVoice = (classResult.type == SmartAudioClassifier.AudioContentType.SPOKEN_VOICE && classResult.confidence >= 0.58f) ||
+                (classResult.speechCadence >= 0.60f && classResult.vocalEnergy >= 0.20f && classResult.beatStrength <= 0.45f)
+
+            if (isSpokenVoice && classResult.type != SmartAudioClassifier.AudioContentType.ACAPELLA_SINGING) {
                 hasSpeechCrossfadeInitiatedForThisTrack = true
-                Log.d(TAG, "Speech detected near end ($remSec s remaining). Initiating speech-aware crossfade.")
+                Log.d(TAG, "Speech/talk detected professionally ($remSec s remaining). Applying crossfade immediately!")
                 onSpeechAwareCrossfadeRequested?.invoke()
                 return
             }
@@ -311,22 +334,26 @@ class SmartDjPerformanceEngine(
                 return
             }
 
-            // Guard: Never perform 8-Beat Loop over singing or speech
-            val currentAwareness = _currentAudioContentType.value
-            if (moment.effectType == DjEffectType.EIGHT_BEAT_LOOP &&
-                (currentAwareness == SmartAudioClassifier.AudioContentType.BEAT_AND_VOCALS ||
-                 currentAwareness == SmartAudioClassifier.AudioContentType.SPOKEN_VOICE ||
-                 currentAwareness == SmartAudioClassifier.AudioContentType.ACAPELLA_SINGING)
-            ) {
-                Log.d(TAG, "Deferring 8-Beat Loop: vocal/speech content detected ($currentAwareness)")
-                moment.hasTriggered = true
-                scheduleNextMoment(currentPosSec + 5)
-                return
+            // Guard: Strict Beat Filter single-execution limit & Flanger separation (>= 25s apart)
+            if (moment.effectType == DjEffectType.BEAT_FILTER) {
+                val isNearFlanger = (lastFlangerTriggerSec >= 0 && kotlin.math.abs(currentPosSec - lastFlangerTriggerSec) < 25)
+                if (hasBeatFilterTriggeredForThisTrack || isNearFlanger) {
+                    Log.d(TAG, "Beat Filter cannot run twice or near flanger; dynamically switching to scratch.")
+                    moment.hasTriggered = true
+                    val fallbackScratch = if (Random.nextBoolean()) DjEffectType.BABY_SCRATCH else DjEffectType.FLARE_SCRATCH
+                    pendingMoment = ScheduledDjMoment(fallbackScratch, currentPosSec, hasTriggered = false)
+                    return
+                }
             }
 
             moment.hasTriggered = true
             if (moment.effectType == DjEffectType.FLANGER) {
                 hasFlangerTriggeredForThisTrack = true
+                lastFlangerTriggerSec = currentPosSec
+            }
+            if (moment.effectType == DjEffectType.BEAT_FILTER) {
+                hasBeatFilterTriggeredForThisTrack = true
+                lastBeatFilterTriggerSec = currentPosSec
             }
 
             _isDjEffectExecuting.value = true
@@ -355,7 +382,7 @@ class SmartDjPerformanceEngine(
         lastHandledPositionSec = currentPosSec
     }
 
-    private fun runAudioAwarenessAnalysis(track: MusicTrack, currentPosSec: Int) {
+    private fun runAudioAwarenessAnalysis(track: MusicTrack, currentPosSec: Int, isPlaying: Boolean, isCrossfading: Boolean) {
         engineScope.launch {
             try {
                 val snippetPcm = if (track.contentUri.isNotBlank()) {
@@ -372,6 +399,21 @@ class SmartDjPerformanceEngine(
                 val result = processor.smartAudioClassifier.analyzePcm(snippetPcm)
                 _currentClassification.value = result
                 _currentAudioContentType.value = result.type
+
+                // Immediate speech check upon analysis completion - apply crossfade immediately
+                val remSec = trackDurationSec - currentPosSec
+                if (isPlaying && !hasSpeechCrossfadeInitiatedForThisTrack && !isCrossfading && remSec <= 75 && currentPosSec >= 12) {
+                    val isSpoken = (result.type == SmartAudioClassifier.AudioContentType.SPOKEN_VOICE && result.confidence >= 0.58f) ||
+                        (result.speechCadence >= 0.60f && result.vocalEnergy >= 0.20f && result.beatStrength <= 0.45f)
+
+                    if (isSpoken && result.type != SmartAudioClassifier.AudioContentType.ACAPELLA_SINGING) {
+                        hasSpeechCrossfadeInitiatedForThisTrack = true
+                        Log.d(TAG, "Spoken voice confirmed in real-time audio analysis. Applying crossfade immediately!")
+                        withContext(Dispatchers.Main) {
+                            onSpeechAwareCrossfadeRequested?.invoke()
+                        }
+                    }
+                }
             } catch (e: Throwable) {
                 Log.w(TAG, "Awareness analysis fallback: ${e.message}")
             }
@@ -379,7 +421,7 @@ class SmartDjPerformanceEngine(
     }
 
     /**
-     * Direct manual trigger from UI pads (e.g. tapping "Baby Scratch", "Flare Scratch", "Flanger", "8-Beat Loop").
+     * Direct manual trigger from UI pads (e.g. tapping "Baby Scratch", "Flare Scratch", "Flanger", "Beat Filter").
      */
     @Synchronized
     fun triggerManualEffect(
@@ -395,6 +437,11 @@ class SmartDjPerformanceEngine(
     ) {
         if (effect == DjEffectType.FLANGER) {
             hasFlangerTriggeredForThisTrack = true
+            lastFlangerTriggerSec = currentTrack?.durationSec?.let { (it * 0.5).toInt() } ?: 60
+        }
+        if (effect == DjEffectType.BEAT_FILTER) {
+            hasBeatFilterTriggeredForThisTrack = true
+            lastBeatFilterTriggerSec = currentTrack?.durationSec?.let { (it * 0.5).toInt() } ?: 60
         }
 
         _isDjEffectExecuting.value = true
