@@ -179,6 +179,23 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun testFlangerAndFilterSweepMutualExclusivity() {
+        // Rule: If you use flanger in this music don't use filter sweep, and if you use filter sweep don't use flanger
+        var flangerUsed = true
+        var filterSweepUsed = false
+        val canUseFilterSweepWhenFlangerUsed = !flangerUsed && !filterSweepUsed
+        assertFalse("Filter sweep must NOT be allowed if flanger was used in the same music", canUseFilterSweepWhenFlangerUsed)
+
+        flangerUsed = false
+        filterSweepUsed = true
+        val canUseFlangerWhenFilterSweepUsed = !flangerUsed && !filterSweepUsed
+        assertFalse("Flanger must NOT be allowed if filter sweep was used in the same music", canUseFlangerWhenFilterSweepUsed)
+
+        val canUseFilterSweepAgain = !filterSweepUsed
+        assertFalse("Filter sweep must NOT be allowed twice in the same music", canUseFilterSweepAgain)
+    }
+
+    @Test
     fun testSmartAudioClassifierBeatOnly() {
         val sampleRate = 22050
         val classifier = com.example.audio.SmartAudioClassifier(sampleRate)

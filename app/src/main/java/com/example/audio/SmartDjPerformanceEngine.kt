@@ -86,10 +86,12 @@ class SmartDjPerformanceEngine(
 
     // Performance constraints
     private var hasFlangerTriggeredForThisTrack = false
+    private var hasFilterSweepTriggeredForThisTrack = false
     private var hasBeatFilterTriggeredForThisTrack = false
     private var lastFlangerTriggerSec = -1
     private var lastBeatFilterTriggerSec = -1
     private var hasSpeechCrossfadeInitiatedForThisTrack = false
+    private var isTrackCleanPlayback = false
     private var lastAnalysisTimestampMs = 0L
 
     /**
@@ -121,6 +123,7 @@ class SmartDjPerformanceEngine(
         lastHandledPositionSec = -1
         lastAnalysisSec = -1
         hasFlangerTriggeredForThisTrack = false
+        hasFilterSweepTriggeredForThisTrack = false
         hasBeatFilterTriggeredForThisTrack = false
         lastFlangerTriggerSec = -1
         lastBeatFilterTriggerSec = -1
@@ -135,7 +138,15 @@ class SmartDjPerformanceEngine(
             return
         }
 
-        // Schedule first DJ moment (targeting ~16-20 seconds after track start)
+        // Randomize: Not every music played should have effects. Leave ~38% of songs completely clean without any effects.
+        isTrackCleanPlayback = Random.nextFloat() < 0.38f
+        if (isTrackCleanPlayback) {
+            pendingMoment = null
+            Log.d(TAG, "Track ${track.id} selected for clean natural playback (zero DJ effects)")
+            return
+        }
+
+        // Schedule first DJ moment
         scheduleNextMoment(currentSec = 0)
     }
 
@@ -150,68 +161,28 @@ class SmartDjPerformanceEngine(
             return
         }
 
-        val trackId = currentScheduledTrackId
-
-        if (currentSec < 15) {
+        if (currentSec < crossfadeStartSec - 18) {
             // ─────────────────────────────────────────────────────────────────
-            // 1. Initial Scratch Moment: Target approximately 16 to 20 seconds
-            // ─────────────────────────────────────────────────────────────────
-            val targetSec = Random.nextInt(16, 21).coerceAtMost((crossfadeStartSec - 8).coerceAtLeast(10))
-
-            // Intelligent selection: Baby Scratch, Flare Scratch, or Clean Play (~28% probability)
-            val isCleanPlay = Random.nextFloat() < 0.28f
-
-            if (isCleanPlay) {
-                trackId?.let { history.recordCleanPlay(it) }
-                Log.d(TAG, "Track $trackId selected for clean intro play")
-                scheduleMidSongMoment(currentSec = targetSec + 4, crossfadeStartSec = crossfadeStartSec)
-            } else {
-                val lastTrackEffect = trackId?.let { history.getLastEffectForTrack(it) }
-                val lastGlobalEffect = history.getLastGlobalEffect()
-
-                val chosenTechnique = when {
-                    lastTrackEffect == DjEffectType.BABY_SCRATCH -> DjEffectType.FLARE_SCRATCH
-                    lastTrackEffect == DjEffectType.FLARE_SCRATCH -> DjEffectType.BABY_SCRATCH
-                    lastGlobalEffect == DjEffectType.BABY_SCRATCH -> DjEffectType.FLARE_SCRATCH
-                    lastGlobalEffect == DjEffectType.FLARE_SCRATCH -> DjEffectType.BABY_SCRATCH
-                    else -> if (Random.nextBoolean()) DjEffectType.BABY_SCRATCH else DjEffectType.FLARE_SCRATCH
-                }
-
-                pendingMoment = ScheduledDjMoment(
-                    effectType = chosenTechnique,
-                    triggerPositionSec = targetSec,
-                    hasTriggered = false
-                )
-                Log.d(TAG, "Scheduled initial scratch ${chosenTechnique.displayName} at ${targetSec}s for track $trackId")
-            }
-        } else if (currentSec < crossfadeStartSec - 18) {
-            // ─────────────────────────────────────────────────────────────────
-            // 2. Mid-Song Moment: Flanger (max 1x) or Filter Sweep
+            // 1. Mid-Song Moment: Flanger OR Filter Sweep (Mutually Exclusive, max 1x)
             // ─────────────────────────────────────────────────────────────────
             scheduleMidSongMoment(currentSec, crossfadeStartSec)
         } else {
             // ─────────────────────────────────────────────────────────────────
-            // 3. Outro Moment: ~6s prior to crossfade start (near crossfade)
+            // 2. Outro Moment: ~6s prior to crossfade start (near crossfade)
+            // Rule: "When you are near crossfade use Beat filter"
             // ─────────────────────────────────────────────────────────────────
             val outroSec = (crossfadeStartSec - 6).coerceAtLeast(currentSec + 2)
             if (outroSec < crossfadeStartSec - 3) {
-                // Choose between Beat Filter and Turntable Scratch near crossfade
-                // Rule: Never use Beat Filter twice in music and do not place it near Flanger (>= 25s apart)
-                val canUseBeatFilter = !hasBeatFilterTriggeredForThisTrack &&
-                    (lastFlangerTriggerSec < 0 || kotlin.math.abs(outroSec - lastFlangerTriggerSec) >= 25)
-
-                val chosenOutroEffect = if (canUseBeatFilter && Random.nextBoolean()) {
-                    DjEffectType.BEAT_FILTER
+                if (!hasBeatFilterTriggeredForThisTrack) {
+                    pendingMoment = ScheduledDjMoment(
+                        effectType = DjEffectType.BEAT_FILTER,
+                        triggerPositionSec = outroSec,
+                        hasTriggered = false
+                    )
+                    Log.d(TAG, "Scheduled outro Beat Filter near crossfade at ${outroSec}s")
                 } else {
-                    if (Random.nextBoolean()) DjEffectType.BABY_SCRATCH else DjEffectType.FLARE_SCRATCH
+                    pendingMoment = null
                 }
-
-                pendingMoment = ScheduledDjMoment(
-                    effectType = chosenOutroEffect,
-                    triggerPositionSec = outroSec,
-                    hasTriggered = false
-                )
-                Log.d(TAG, "Scheduled outro ${chosenOutroEffect.displayName} near crossfade at ${outroSec}s")
             } else {
                 pendingMoment = null
             }
@@ -223,26 +194,39 @@ class SmartDjPerformanceEngine(
         val triggerSec = midSec.coerceIn(currentSec + 5, (crossfadeStartSec - 12).coerceAtLeast(currentSec + 5))
 
         if (triggerSec < crossfadeStartSec - 8) {
-            val awareness = _currentAudioContentType.value
-
-            // Selection adhering strictly to constraints:
-            // 1. Flanger allowed NO MORE THAN ONCE per song.
-            // 2. Beat Filter allowed NO MORE THAN ONCE per song, and NEVER near Flanger (>= 25s apart).
-            val canUseBeatFilter = !hasBeatFilterTriggeredForThisTrack &&
-                (lastFlangerTriggerSec < 0 || kotlin.math.abs(triggerSec - lastFlangerTriggerSec) >= 25)
-
-            val chosenEffect = when {
-                !hasFlangerTriggeredForThisTrack -> DjEffectType.FLANGER
-                canUseBeatFilter && Random.nextBoolean() -> DjEffectType.BEAT_FILTER
-                else -> DjEffectType.FILTER_SWEEP
+            // Randomization: 30% chance to skip mid-song effect so only outro Beat Filter plays
+            if (Random.nextFloat() < 0.30f) {
+                Log.d(TAG, "Skipping mid-song effect for track ${currentTrack?.id} to leave section clean")
+                scheduleNextMoment(triggerSec + 4)
+                return
             }
 
-            pendingMoment = ScheduledDjMoment(
-                effectType = chosenEffect,
-                triggerPositionSec = triggerSec,
-                hasTriggered = false
-            )
-            Log.d(TAG, "Scheduled mid-song ${chosenEffect.displayName} at ${triggerSec}s (Awareness: ${awareness.displayName})")
+            // Mutual exclusivity & Single-use:
+            // "dont use filter sweep if you used flanger in the same music"
+            // "If you use flanger in this music dont use filtersweep, and if you use filter sweep dont use flanger in same music"
+            val canUseFlanger = !hasFlangerTriggeredForThisTrack && !hasFilterSweepTriggeredForThisTrack
+            val canUseFilterSweep = !hasFilterSweepTriggeredForThisTrack && !hasFlangerTriggeredForThisTrack
+
+            val chosenEffect = when {
+                canUseFlanger && canUseFilterSweep -> {
+                    // Randomly choose between Flanger and Filter Sweep
+                    if (Random.nextBoolean()) DjEffectType.FLANGER else DjEffectType.FILTER_SWEEP
+                }
+                canUseFlanger -> DjEffectType.FLANGER
+                canUseFilterSweep -> DjEffectType.FILTER_SWEEP
+                else -> null
+            }
+
+            if (chosenEffect != null) {
+                pendingMoment = ScheduledDjMoment(
+                    effectType = chosenEffect,
+                    triggerPositionSec = triggerSec,
+                    hasTriggered = false
+                )
+                Log.d(TAG, "Scheduled mid-song ${chosenEffect.displayName} at ${triggerSec}s")
+            } else {
+                pendingMoment = null
+            }
         } else {
             pendingMoment = null
         }
@@ -276,7 +260,7 @@ class SmartDjPerformanceEngine(
         }
 
         // CRITICAL: If crossfade has begun, abort any DJ effect immediately to prevent dual transitions
-        if (isCrossfading) {
+        if (isCrossfading || isTrackCleanPlayback) {
             if (processor.isEffectActive) {
                 cancelCurrentPerformance(equalizer, reverb, baseEqGains, baseReverbPreset, mediaPlayer, basePitch, onVolumeDuck)
             }
@@ -326,30 +310,47 @@ class SmartDjPerformanceEngine(
 
         // Trigger when reached or passed scheduled position
         if (isPlaying && currentPosSec >= moment.triggerPositionSec && currentPosSec <= moment.triggerPositionSec + 5) {
-            // Guard: Strict Flanger single-execution limit per song
-            if (moment.effectType == DjEffectType.FLANGER && hasFlangerTriggeredForThisTrack) {
-                Log.d(TAG, "Skipping repeated Flanger trigger for track ${track.id}; already performed once.")
+            // Rule: Hide and do NOT use scratches during music playback
+            if (moment.effectType == DjEffectType.BABY_SCRATCH ||
+                moment.effectType == DjEffectType.FLARE_SCRATCH ||
+                moment.effectType == DjEffectType.VINYL_SCRATCH) {
+                Log.d(TAG, "Scratches are hidden and excluded from playback.")
                 moment.hasTriggered = true
                 scheduleNextMoment(currentPosSec + 4)
                 return
             }
 
-            // Guard: Strict Beat Filter single-execution limit & Flanger separation (>= 25s apart)
-            if (moment.effectType == DjEffectType.BEAT_FILTER) {
-                val isNearFlanger = (lastFlangerTriggerSec >= 0 && kotlin.math.abs(currentPosSec - lastFlangerTriggerSec) < 25)
-                if (hasBeatFilterTriggeredForThisTrack || isNearFlanger) {
-                    Log.d(TAG, "Beat Filter cannot run twice or near flanger; dynamically switching to scratch.")
-                    moment.hasTriggered = true
-                    val fallbackScratch = if (Random.nextBoolean()) DjEffectType.BABY_SCRATCH else DjEffectType.FLARE_SCRATCH
-                    pendingMoment = ScheduledDjMoment(fallbackScratch, currentPosSec, hasTriggered = false)
-                    return
-                }
+            // Rule: If flanger used, don't use filter sweep. If filter sweep used, don't use flanger.
+            // Rule: Each effect applied at most ONCE per song.
+            if (moment.effectType == DjEffectType.FLANGER && (hasFlangerTriggeredForThisTrack || hasFilterSweepTriggeredForThisTrack)) {
+                Log.d(TAG, "Skipping Flanger trigger: cannot run twice or in same song as Filter Sweep.")
+                moment.hasTriggered = true
+                scheduleNextMoment(currentPosSec + 4)
+                return
+            }
+
+            if (moment.effectType == DjEffectType.FILTER_SWEEP && (hasFilterSweepTriggeredForThisTrack || hasFlangerTriggeredForThisTrack)) {
+                Log.d(TAG, "Skipping Filter Sweep trigger: cannot run twice or in same song as Flanger.")
+                moment.hasTriggered = true
+                scheduleNextMoment(currentPosSec + 4)
+                return
+            }
+
+            // Rule: Beat Filter single execution guarantee
+            if (moment.effectType == DjEffectType.BEAT_FILTER && hasBeatFilterTriggeredForThisTrack) {
+                Log.d(TAG, "Skipping Beat Filter trigger: already performed once on track ${track.id}.")
+                moment.hasTriggered = true
+                scheduleNextMoment(currentPosSec + 4)
+                return
             }
 
             moment.hasTriggered = true
             if (moment.effectType == DjEffectType.FLANGER) {
                 hasFlangerTriggeredForThisTrack = true
                 lastFlangerTriggerSec = currentPosSec
+            }
+            if (moment.effectType == DjEffectType.FILTER_SWEEP) {
+                hasFilterSweepTriggeredForThisTrack = true
             }
             if (moment.effectType == DjEffectType.BEAT_FILTER) {
                 hasBeatFilterTriggeredForThisTrack = true
@@ -438,6 +439,9 @@ class SmartDjPerformanceEngine(
         if (effect == DjEffectType.FLANGER) {
             hasFlangerTriggeredForThisTrack = true
             lastFlangerTriggerSec = currentTrack?.durationSec?.let { (it * 0.5).toInt() } ?: 60
+        }
+        if (effect == DjEffectType.FILTER_SWEEP) {
+            hasFilterSweepTriggeredForThisTrack = true
         }
         if (effect == DjEffectType.BEAT_FILTER) {
             hasBeatFilterTriggeredForThisTrack = true

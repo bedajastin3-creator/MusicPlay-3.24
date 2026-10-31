@@ -11,11 +11,11 @@ android {
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "co.musicplay.ap.kngucr"
+    applicationId = "co.musicplay.ap"
     minSdk = 24
     targetSdk = 36
-    versionCode = 321
-    versionName = "3.21"
+    versionCode = 350
+    versionName = "3.50"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

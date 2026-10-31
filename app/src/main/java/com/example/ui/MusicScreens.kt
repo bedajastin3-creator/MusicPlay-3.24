@@ -3735,8 +3735,6 @@ fun DjEffectPads(
     val awarenessType by viewModel.smartAudioContentType.collectAsState()
 
     val effects = listOf(
-        Triple(DjEffectType.BABY_SCRATCH, "Baby Scratch", Icons.Filled.Refresh),
-        Triple(DjEffectType.FLARE_SCRATCH, "Flare Scratch", Icons.Filled.Speed),
         Triple(DjEffectType.FLANGER, "Flanger", Icons.Filled.AutoAwesome),
         Triple(DjEffectType.FILTER_SWEEP, "Filter Sweep", Icons.Filled.Tune),
         Triple(DjEffectType.BEAT_FILTER, "Beat Filter", Icons.Filled.PlayArrow)
