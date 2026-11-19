@@ -34,7 +34,6 @@ import com.example.ui.localization.getAppStrings
 import com.example.ui.AppNativeAdsManager
 import com.example.ui.CrossfadeRewardedAdManager
 import com.example.ui.theme.MyApplicationTheme
-import com.google.android.gms.ads.MobileAds
 
 class MainActivity : ComponentActivity() {
 
@@ -56,13 +55,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Initialize Google Mobile Ads SDK using App ID and pre-warm native & rewarded ads
-        MobileAds.initialize(this) {
-            AppNativeAdsManager.preloadInitialAds(this)
+        // Initialize Google Mobile Ads SDK once per app lifecycle; preload rewarded ad only after init completes
+        AppNativeAdsManager.initializeMobileAds(this) {
             CrossfadeRewardedAdManager.preload(this)
         }
-        AppNativeAdsManager.preloadInitialAds(this)
-        CrossfadeRewardedAdManager.preload(this)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
@@ -126,6 +122,9 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         inAppUpdateManager.cleanup()
+        if (isFinishing && !isChangingConfigurations) {
+            AppNativeAdsManager.onHostActivityFinishing()
+        }
     }
 
     override fun onNewIntent(intent: Intent) {

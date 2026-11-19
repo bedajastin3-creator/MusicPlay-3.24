@@ -1,49 +1,74 @@
 package com.example.ui
 
+import android.app.Activity
+import android.app.Application
 import android.content.Context
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
-import android.view.Gravity
-import android.view.ViewGroup
-import android.widget.FrameLayout
-import android.widget.ImageView
-import android.widget.LinearLayout
-import android.widget.TextView
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.runtime.snapshots.SnapshotStateList
-import androidx.compose.ui.Alignment
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.State
+import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import com.example.R
+import com.example.ads.AdLoadErrorInfo
+import com.example.ads.AdRequestCallbacks
+import com.example.ads.ManagedAdEntry
+import com.example.ads.ManagedAdHandle
+import com.example.ads.NativeAdCacheConfig
+import com.example.ads.NativeAdController
+import com.example.ads.NativeAdDiagnosticsSnapshot
+import com.example.ads.NativeAdLoaderPort
+import com.example.ads.NativeAdScheduler
 import com.example.data.MusicTrack
-import com.example.ui.theme.*
-import com.google.android.gms.ads.*
-import com.google.android.gms.ads.nativead.MediaView
+import com.example.ui.theme.SpaceCardBg
+import com.example.ui.theme.TealPrimary
+import com.google.android.gms.ads.AdListener
+import com.google.android.gms.ads.AdLoader
+import com.google.android.gms.ads.AdRequest
+import com.google.android.gms.ads.FullScreenContentCallback
+import com.google.android.gms.ads.LoadAdError
+import com.google.android.gms.ads.MobileAds
 import com.google.android.gms.ads.nativead.NativeAd
 import com.google.android.gms.ads.nativead.NativeAdOptions
 import com.google.android.gms.ads.nativead.NativeAdView
 import com.google.android.gms.ads.rewarded.RewardedAd
 import com.google.android.gms.ads.rewarded.RewardedAdLoadCallback
+import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * AdMob Configuration Constants
+ * AdMob Configuration Constants (Production Unit IDs — preserved unchanged)
  * Official App ID: ca-app-pub-8155064094205693~4470440036 (declared in AndroidManifest.xml)
- * Approved Rewarded Ad Unit ID for DJ Crossfade Switching: ca-app-pub-8155064094205693/2082546817
- * Five Approved Native Advanced Ad Unit IDs:
  */
 const val NATIVE_AD_UNIT_1 = "ca-app-pub-8155064094205693/7166498907" // Songs List
 const val NATIVE_AD_UNIT_2 = "ca-app-pub-8155064094205693/8340601899" // Albums Grid
@@ -58,10 +83,10 @@ const val ADMOB_REWARDED_AD_UNIT_ID = "ca-app-pub-8155064094205693/2082546817"
 /**
  * Helper to locate the hosting Activity from Context.
  */
-fun Context.findActivity(): android.app.Activity? {
+fun Context.findActivity(): Activity? {
     var ctx = this
     while (ctx is android.content.ContextWrapper) {
-        if (ctx is android.app.Activity) return ctx
+        if (ctx is Activity) return ctx
         ctx = ctx.baseContext
     }
     return null
@@ -69,6 +94,7 @@ fun Context.findActivity(): android.app.Activity? {
 
 /**
  * Singleton manager to preload and show AdMob Rewarded Ads when switching DJ Crossfade seconds.
+ * Kept independent from Native Ad caching and disposal.
  */
 object CrossfadeRewardedAdManager {
     private var rewardedAd: RewardedAd? = null
@@ -125,166 +151,468 @@ object CrossfadeRewardedAdManager {
     }
 }
 
+private class SdkNativeAdHandle(
+    override val sdkNativeAd: NativeAd
+) : ManagedAdHandle {
+    override fun setOnPaidEventCallback(onPaid: (valueMicros: Long, currencyCode: String, precisionType: Int) -> Unit) {
+        sdkNativeAd.setOnPaidEventListener { adValue ->
+            onPaid(adValue.valueMicros, adValue.currencyCode, adValue.precisionType)
+        }
+    }
+
+    override fun destroy() {
+        sdkNativeAd.destroy()
+    }
+}
+
 /**
- * Singleton manager to preload, maintain warm cache, and manage Native Advanced Ads
- * across the 5 approved units without disappearing on screen changes.
+ * Centralized, lifecycle-aware AdMob Native Ad Manager backed by [NativeAdController].
+ * Maintains independent per-unit caches, strictly unique placement assignments,
+ * bounded exponential backoff retries, 1-hour expiration, and paid/impression telemetry.
  */
 object AppNativeAdsManager {
-    private const val TAG = "AppNativeAds"
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val unitRevisions = mutableStateMapOf<String, Int>()
+    private val observersRegistered = AtomicBoolean(false)
+    private val _appInForegroundState = mutableStateOf(true)
+    val appInForegroundState: State<Boolean> get() = _appInForegroundState
 
-    // Map from adUnitId to an observable list of loaded NativeAd objects
-    private val adsMap = mutableMapOf<String, SnapshotStateList<NativeAd>>()
-    private val loadingUnits = mutableSetOf<String>()
+    @Volatile
+    private var appContext: Context? = null
 
-    fun getLoadedAds(adUnitId: String): SnapshotStateList<NativeAd> {
-        return synchronized(this) {
-            adsMap.getOrPut(adUnitId) { mutableStateListOf() }
+    private val scheduler = object : NativeAdScheduler {
+        override fun postDelayed(delayMs: Long, runnable: Runnable) {
+            mainHandler.postDelayed(runnable, delayMs)
+        }
+
+        override fun removeCallbacks(runnable: Runnable) {
+            mainHandler.removeCallbacks(runnable)
+        }
+
+        override fun runOnMainThread(runnable: Runnable) {
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                runnable.run()
+            } else {
+                mainHandler.post(runnable)
+            }
         }
     }
 
-    /**
-     * Preloads initial native ads across all 5 units on app startup.
-     */
-    fun preloadInitialAds(context: Context) {
-        val appContext = context.applicationContext
-        val allUnits = listOf(
-            NATIVE_AD_UNIT_1,
-            NATIVE_AD_UNIT_2,
-            NATIVE_AD_UNIT_3,
-            NATIVE_AD_UNIT_4,
-            NATIVE_AD_UNIT_5
-        )
-        for (unit in allUnits) {
-            requestAds(appContext, unit, targetCount = 2)
+    private val loaderPort = object : NativeAdLoaderPort {
+        override fun initializeMobileAds(onCompleted: () -> Unit) {
+            val ctx = appContext ?: return
+            MobileAds.initialize(ctx) {
+                scheduler.runOnMainThread(Runnable { onCompleted() })
+            }
+        }
+
+        override fun loadSingleNativeAd(adUnitId: String, callbacks: AdRequestCallbacks) {
+            val ctx = appContext ?: return
+            val adLoader = AdLoader.Builder(ctx, adUnitId)
+                .forNativeAd { nativeAd ->
+                    callbacks.onAdLoaded(SdkNativeAdHandle(nativeAd))
+                }
+                .withAdListener(object : AdListener() {
+                    override fun onAdFailedToLoad(loadAdError: LoadAdError) {
+                        callbacks.onAdFailed(
+                            AdLoadErrorInfo(
+                                code = loadAdError.code,
+                                domain = loadAdError.domain,
+                                message = loadAdError.message
+                            )
+                        )
+                    }
+
+                    override fun onAdImpression() {
+                        callbacks.onAdImpression()
+                    }
+
+                    override fun onAdClicked() {
+                        callbacks.onAdClicked()
+                    }
+                })
+                .withNativeAdOptions(
+                    NativeAdOptions.Builder()
+                        .setAdChoicesPlacement(NativeAdOptions.ADCHOICES_TOP_RIGHT)
+                        .setReturnUrlsForImageAssets(false)
+                        .build()
+                )
+                .build()
+
+            adLoader.loadAd(AdRequest.Builder().build())
+        }
+
+        override fun isNetworkAvailable(): Boolean {
+            val ctx = appContext ?: return false
+            return try {
+                val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                    ?: return true
+                val network = cm.activeNetwork ?: return false
+                val caps = cm.getNetworkCapabilities(network) ?: return false
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            } catch (_: SecurityException) {
+                true
+            } catch (_: Exception) {
+                true
+            }
         }
     }
 
-    /**
-     * Requests native ads for an ad unit up to targetCount smoothly without burst flooding.
-     */
-    fun requestAds(context: Context, adUnitId: String, targetCount: Int = 1) {
-        val appContext = context.applicationContext
-        val list = getLoadedAds(adUnitId)
-        if (list.size >= targetCount) return
-        if (loadingUnits.contains(adUnitId)) return
+    val controller: NativeAdController = NativeAdController(
+        config = NativeAdCacheConfig(),
+        loaderPort = loaderPort,
+        scheduler = scheduler,
+        onUnitStateChanged = { adUnitId ->
+            scheduler.runOnMainThread(Runnable {
+                unitRevisions[adUnitId] = (unitRevisions[adUnitId] ?: 0) + 1
+            })
+        }
+    )
 
-        loadingUnits.add(adUnitId)
-        loadNextAd(appContext, adUnitId, targetCount)
+    fun initializeMobileAds(context: Context, onInitialized: () -> Unit = {}) {
+        val app = context.applicationContext
+        appContext = app
+        registerLifecycleAndNetworkObservers(app)
+        controller.initializeSdkOnce(onInitialized)
     }
 
-    private fun loadNextAd(context: Context, adUnitId: String, targetCount: Int) {
-        val list = getLoadedAds(adUnitId)
-        if (list.size >= targetCount) {
-            loadingUnits.remove(adUnitId)
-            return
-        }
+    private fun registerLifecycleAndNetworkObservers(app: Context) {
+        if (!observersRegistered.compareAndSet(false, true)) return
 
-        val adLoader = AdLoader.Builder(context, adUnitId)
-            .forNativeAd { nativeAd ->
-                list.add(nativeAd)
-                Log.d(TAG, "Native ad loaded for $adUnitId (pool size: ${list.size})")
-                if (list.size < targetCount) {
-                    loadNextAd(context, adUnitId, targetCount)
-                } else {
-                    loadingUnits.remove(adUnitId)
+        val application = app as? Application
+        application?.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+            private var startedCount = 0
+
+            override fun onActivityStarted(activity: Activity) {
+                val wasBackground = startedCount == 0
+                startedCount++
+                if (wasBackground) {
+                    _appInForegroundState.value = true
+                    controller.onAppForegroundChanged(true)
                 }
             }
-            .withAdListener(object : AdListener() {
-                override fun onAdFailedToLoad(loadAdError: LoadAdError) {
-                    Log.w(TAG, "Native ad load failed for $adUnitId: ${loadAdError.message} (code ${loadAdError.code})")
-                    loadingUnits.remove(adUnitId)
-                    if (list.isEmpty()) {
-                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                            requestAds(context, adUnitId, targetCount)
-                        }, 5000L)
-                    }
-                }
-            })
-            .withNativeAdOptions(
-                NativeAdOptions.Builder()
-                    .setAdChoicesPlacement(NativeAdOptions.ADCHOICES_TOP_RIGHT)
-                    .setReturnUrlsForImageAssets(false)
-                    .build()
-            )
-            .build()
 
-        adLoader.loadAd(AdRequest.Builder().build())
+            override fun onActivityStopped(activity: Activity) {
+                startedCount = (startedCount - 1).coerceAtLeast(0)
+                if (startedCount == 0) {
+                    _appInForegroundState.value = false
+                    controller.onAppForegroundChanged(false)
+                }
+            }
+
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+            override fun onActivityResumed(activity: Activity) {}
+            override fun onActivityPaused(activity: Activity) {}
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+            override fun onActivityDestroyed(activity: Activity) {}
+        })
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                val cm = app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                cm?.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        scheduler.runOnMainThread(Runnable {
+                            controller.onConnectivityChanged(true)
+                        })
+                    }
+
+                    override fun onLost(network: Network) {
+                        scheduler.runOnMainThread(Runnable {
+                            controller.onConnectivityChanged(loaderPort.isNetworkAvailable())
+                        })
+                    }
+                })
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    fun observeUnitRevision(adUnitId: String): Int {
+        return unitRevisions[adUnitId] ?: 0
+    }
+
+    fun registerScreenDemand(context: Context, screenKey: String, adUnitId: String, eligibleSlotCount: Int) {
+        if (appContext == null) {
+            appContext = context.applicationContext
+        }
+        controller.registerScreenDemand(screenKey, adUnitId, eligibleSlotCount)
+    }
+
+    fun unregisterScreenDemand(screenKey: String, adUnitId: String) {
+        controller.unregisterScreenDemand(screenKey, adUnitId)
+    }
+
+    fun acquireAdForSlot(adUnitId: String, placementKey: String): ManagedAdEntry? {
+        return controller.acquireAdForSlot(adUnitId, placementKey)
+    }
+
+    fun onViewAttached(adUnitId: String, instanceId: String, viewToken: Int, placementKey: String) {
+        controller.onViewAttached(adUnitId, instanceId, viewToken, placementKey)
+    }
+
+    fun onPlacementVisible(adUnitId: String, instanceId: String, placementKey: String) {
+        controller.onPlacementVisible(adUnitId, instanceId, placementKey)
+    }
+
+    fun onViewDetached(adUnitId: String, instanceId: String, viewToken: Int) {
+        controller.onViewDetached(adUnitId, instanceId, viewToken)
+    }
+
+    fun releaseSlot(adUnitId: String, placementKey: String) {
+        controller.releaseSlot(adUnitId, placementKey)
+    }
+
+    /**
+     * Releases UI-bound ad slots and pending retries when the host Activity genuinely finishes,
+     * while keeping the singleton reusable if an Activity restarts in the same MusicPlaybackService process.
+     */
+    fun onHostActivityFinishing() {
+        controller.clearUiSession()
+    }
+
+    fun getDiagnosticsSnapshot(): NativeAdDiagnosticsSnapshot = controller.getDiagnosticsSnapshot()
+}
+
+/**
+ * Provides the scrollable container's [LayoutCoordinates] so nested native ad slots can measure
+ * actual intersection with the visible viewport rather than raw window attachment alone.
+ */
+val LocalAdViewportCoordinates = compositionLocalOf<LayoutCoordinates?> { null }
+
+/**
+ * Centrally signals when a modal overlay or dialog obscures the underlying screen content.
+ */
+val LocalIsAdOccludedByOverlay = compositionLocalOf { false }
+
+/**
+ * Minimum visible area fraction [0f..1f] required before recording `PLACEMENT_VISIBLE`.
+ */
+val LocalAdMinVisibleFraction = compositionLocalOf { 0.5f }
+
+fun computeViewportVisibleFraction(
+    adCoords: LayoutCoordinates,
+    viewportCoords: LayoutCoordinates?
+): Float {
+    if (!adCoords.isAttached) return 0f
+    val fullWidth = adCoords.size.width.toFloat()
+    val fullHeight = adCoords.size.height.toFloat()
+    val fullArea = fullWidth * fullHeight
+    if (fullArea <= 0f) return 0f
+
+    val adBounds = adCoords.boundsInWindow()
+    if (adBounds.isEmpty) return 0f
+
+    val effectiveRect = if (viewportCoords != null && viewportCoords.isAttached) {
+        val viewportBounds = viewportCoords.boundsInWindow()
+        if (viewportBounds.isEmpty) return 0f
+        adBounds.intersect(viewportBounds)
+    } else {
+        adBounds
+    }
+    if (effectiveRect.isEmpty || effectiveRect.width <= 0f || effectiveRect.height <= 0f) {
+        return 0f
+    }
+    return ((effectiveRect.width * effectiveRect.height) / fullArea).coerceIn(0f, 1f)
+}
+
+fun isMeaningfullyVisibleInViewport(
+    adBounds: Rect,
+    adFullWidthPx: Float,
+    adFullHeightPx: Float,
+    viewportBounds: Rect?,
+    isAttached: Boolean,
+    isAppInForeground: Boolean,
+    isOccludedByModal: Boolean,
+    minVisibleFraction: Float = 0.5f
+): Boolean {
+    if (!isAttached || !isAppInForeground || isOccludedByModal) return false
+    val fullArea = adFullWidthPx * adFullHeightPx
+    if (fullArea <= 0f || adBounds.isEmpty) return false
+    val intersection = if (viewportBounds != null) {
+        if (viewportBounds.isEmpty) return false
+        adBounds.intersect(viewportBounds)
+    } else {
+        adBounds
+    }
+    if (intersection.isEmpty || intersection.width <= 0f || intersection.height <= 0f) return false
+    val fraction = ((intersection.width * intersection.height) / fullArea).coerceIn(0f, 1f)
+    return fraction >= minVisibleFraction.coerceIn(0.01f, 1f)
+}
+
+/**
+ * Provides the scrollable container's [LayoutCoordinates] and combined modal occlusion flag
+ * to descendant native ad slots via CompositionLocals.
+ */
+@Composable
+fun ProvideScrollAdViewport(
+    isExtraOccluded: Boolean = false,
+    content: @Composable (viewportModifier: Modifier) -> Unit
+) {
+    val viewportCoords = remember { mutableStateOf<LayoutCoordinates?>(null) }
+    val occluded = LocalIsAdOccludedByOverlay.current || isExtraOccluded
+    CompositionLocalProvider(
+        LocalAdViewportCoordinates provides viewportCoords.value,
+        LocalIsAdOccludedByOverlay provides occluded
+    ) {
+        content(Modifier.onGloballyPositioned { viewportCoords.value = it })
     }
 }
 
 /**
- * Remembers and preloads AdMob Native Ads using the persistent AppNativeAdsManager.
- * Retains loaded ads across navigation backstack so they never disappear.
+ * Builds a deterministic, collision-resistant screen key for category/folder detail views so
+ * distinct folders or categories sharing the same display name never share ad placement keys.
+ */
+fun buildCategoryDetailScreenKey(
+    categoryType: String,
+    title: String,
+    tracks: List<MusicTrack>,
+    explicitCategoryId: String? = null
+): String {
+    val normalizedType = categoryType.trim().lowercase().replace(Regex("[^a-z0-9]+"), "_").trim('_')
+    val normalizedTitle = title.trim().lowercase().replace(Regex("[^a-z0-9]+"), "_").trim('_').take(24)
+    val uniquePayload = if (!explicitCategoryId.isNullOrBlank()) {
+        explicitCategoryId
+    } else {
+        tracks.map { track ->
+            val parentHint = track.contentUri.substringBeforeLast('/', "")
+            "${track.id}|${track.contentUri}|$parentHint|${track.folder}|${track.album}|${track.artist}"
+        }.sorted().joinToString(separator = "\n")
+    }
+    val digest = MessageDigest.getInstance("SHA-256")
+        .digest("$categoryType\u0000$title\u0000$uniquePayload".toByteArray(Charsets.UTF_8))
+    val hash = digest.take(8).joinToString("") { "%02x".format(it) }
+    return "category_${normalizedType}_${normalizedTitle}_$hash"
+}
+
+@Stable
+data class ManagedAdSlotState(
+    val entry: ManagedAdEntry?,
+    val visibilityModifier: Modifier
+)
+
+/**
+ * Registers screen-level demand while the screen is active and cancels pending retries
+ * when the screen leaves composition or has zero eligible placements.
  */
 @Composable
-fun rememberNativeAds(
+fun rememberNativeAdScreenDemand(
+    screenKey: String,
     itemCount: Int,
     adUnitId: String,
-    cadence: Int = 3
-): SnapshotStateList<NativeAd> {
+    cadence: Int,
+    maxSlots: Int = Int.MAX_VALUE
+) {
     val context = LocalContext.current
-    val loadedAds = remember(adUnitId) { AppNativeAdsManager.getLoadedAds(adUnitId) }
-    val neededCount = if (itemCount < cadence) 0 else (itemCount / cadence).coerceIn(1, 10)
+    val eligibleSlots = if (itemCount < cadence) 0 else (itemCount / cadence).coerceAtMost(maxSlots)
 
-    LaunchedEffect(itemCount, adUnitId, neededCount) {
-        if (neededCount > 0) {
-            AppNativeAdsManager.requestAds(context, adUnitId, neededCount)
+    DisposableEffect(screenKey, adUnitId, eligibleSlots) {
+        AppNativeAdsManager.registerScreenDemand(
+            context = context,
+            screenKey = screenKey,
+            adUnitId = adUnitId,
+            eligibleSlotCount = eligibleSlots
+        )
+        onDispose {
+            AppNativeAdsManager.unregisterScreenDemand(
+                screenKey = screenKey,
+                adUnitId = adUnitId
+            )
         }
     }
-    return loadedAds
 }
 
 /**
- * State holder for backward-compatibility with screens referencing NativeAdsState.
+ * Acquires and retains a strictly unique [ManagedAdEntry] for one ad placement slot.
+ * Never reuses another slot's ad and releases cleanly when leaving the viewport/navigation.
+ * Records diagnostic `PLACEMENT_VISIBLE` only when attached, in foreground, unobstructed by
+ * modal overlays, and intersecting the scrollable viewport by at least [LocalAdMinVisibleFraction].
  */
-@Stable
-class NativeAdsState(val rawList: SnapshotStateList<NativeAd> = mutableStateListOf()) {
-    val failedAdIndices = mutableStateListOf<Int>()
+@Composable
+fun rememberManagedNativeAdSlot(
+    screenKey: String,
+    adUnitId: String,
+    adIndex: Int,
+    controller: NativeAdController = AppNativeAdsManager.controller
+): ManagedAdSlotState {
+    val placementKey = remember(screenKey, adIndex) { "$screenKey:ad_$adIndex" }
+    val unitRevision = if (controller === AppNativeAdsManager.controller) {
+        AppNativeAdsManager.observeUnitRevision(adUnitId)
+    } else {
+        0
+    }
+    val slotHolder = remember(controller, adUnitId, placementKey) { mutableStateOf<ManagedAdEntry?>(null) }
 
-    val loadedAds: Map<Int, NativeAd> = object : AbstractMap<Int, NativeAd>() {
-        override val entries: Set<Map.Entry<Int, NativeAd>>
-            get() = rawList.mapIndexed { index, ad ->
-                java.util.AbstractMap.SimpleImmutableEntry(index, ad)
-            }.toSet()
-
-        override fun get(key: Int): NativeAd? {
-            if (rawList.isEmpty()) return null
-            return rawList.getOrNull(key) ?: rawList[key % rawList.size]
+    LaunchedEffect(controller, adUnitId, placementKey, unitRevision) {
+        val current = slotHolder.value
+        if (current == null || current.isDisposed || current.pendingDisposal) {
+            slotHolder.value = controller.acquireAdForSlot(adUnitId, placementKey)
         }
-
-        override fun containsKey(key: Int): Boolean = rawList.isNotEmpty()
-        override val size: Int get() = rawList.size
-        override fun isEmpty(): Boolean = rawList.isEmpty()
     }
-}
 
-@Composable
-fun rememberNativeAdsState(
-    itemCount: Int,
-    adUnitId: String = ADMOB_NATIVE_AD_UNIT_ID
-): NativeAdsState {
-    val list = rememberNativeAds(itemCount = itemCount, adUnitId = adUnitId, cadence = 3)
-    return remember(list) {
-        NativeAdsState(rawList = list)
+    DisposableEffect(controller, adUnitId, placementKey) {
+        onDispose {
+            slotHolder.value = null
+            controller.releaseSlot(adUnitId, placementKey)
+        }
     }
-}
 
-@Composable
-fun rememberSongNativeAdsState(
-    itemCount: Int,
-    adUnitId: String = ADMOB_SONGS_NATIVE_AD_UNIT_ID
-): NativeAdsState {
-    val list = rememberNativeAds(itemCount = itemCount, adUnitId = adUnitId, cadence = 10)
-    return remember(list) {
-        NativeAdsState(rawList = list)
+    val viewportCoords = LocalAdViewportCoordinates.current
+    val isOccluded = LocalIsAdOccludedByOverlay.current
+    val minVisibleFraction = LocalAdMinVisibleFraction.current.coerceAtLeast(
+        controller.config.minVisibleAreaFraction
+    )
+    val appInForeground by if (controller === AppNativeAdsManager.controller) {
+        AppNativeAdsManager.appInForegroundState
+    } else {
+        remember(controller) { mutableStateOf(controller.isAppInForeground()) }
     }
+
+    val adCoordsHolder = remember(controller, adUnitId, placementKey) { mutableStateOf<LayoutCoordinates?>(null) }
+    val visibleFractionHolder = remember(controller, adUnitId, placementKey) { mutableFloatStateOf(0f) }
+
+    val active = slotHolder.value?.takeIf { !it.isDisposed && !it.pendingDisposal }
+
+    LaunchedEffect(
+        active?.instanceId,
+        visibleFractionHolder.floatValue,
+        viewportCoords,
+        isOccluded,
+        appInForeground,
+        minVisibleFraction
+    ) {
+        val entry = active ?: return@LaunchedEffect
+        val coords = adCoordsHolder.value ?: return@LaunchedEffect
+        if (!coords.isAttached || isOccluded || !appInForeground || !controller.isAppInForeground()) {
+            return@LaunchedEffect
+        }
+        val fraction = computeViewportVisibleFraction(coords, viewportCoords)
+        if (fraction >= minVisibleFraction) {
+            controller.onPlacementVisible(
+                adUnitId = adUnitId,
+                instanceId = entry.instanceId,
+                placementKey = placementKey
+            )
+        }
+    }
+
+    val visibilityModifier = if (active != null) {
+        Modifier.onGloballyPositioned { coords ->
+            adCoordsHolder.value = coords
+            visibleFractionHolder.floatValue = computeViewportVisibleFraction(coords, viewportCoords)
+        }
+    } else {
+        Modifier
+    }
+
+    return ManagedAdSlotState(entry = active, visibilityModifier = visibilityModifier)
 }
 
 /**
  * Sealed wrapper class to insert Native Ads into the Songs LazyColumn alongside real song tracks.
  */
 sealed class SongListItemWrapper {
-    data class SongItem(val track: MusicTrack) : SongListItemWrapper()
+    data class SongItem(val track: MusicTrack, val occurrence: Int = 0) : SongListItemWrapper()
     data class NativeAdItem(val adIndex: Int) : SongListItemWrapper()
 }
 
@@ -297,8 +625,8 @@ sealed class GridItemWrapper<out T> {
 }
 
 /**
- * Combines real list items with Native Ad items according to AdMob placement policies.
- * Cadence rule: 1 ad after every 3 items in albums and artists (1, 2, 3, ad, 4, 5, 6, ad and more).
+ * Combines real list items with Native Ad slots according to existing placement policies:
+ * Cadence rule: 1 ad after every 3 items in albums and artists (max 20 slots).
  */
 fun <T> buildGridItemsWithAds(
     realItems: List<T>,
@@ -326,7 +654,7 @@ fun <T> buildGridItemsWithAds(
 }
 
 /**
- * Combines real songs with Native Ads according to rules:
+ * Combines real songs with Native Ad slots according to existing rules:
  * - If songs are below 10: do not show ad
  * - If songs >= 10: insert an ad after every 10 songs
  */
@@ -334,15 +662,23 @@ fun buildSongItemsWithAds(
     realItems: List<MusicTrack>,
     failedAdIndices: Collection<Int> = emptyList()
 ): List<SongListItemWrapper> {
+    val occurrences = HashMap<Int, Int>(realItems.size)
     if (realItems.size < 10) {
-        return realItems.map { SongListItemWrapper.SongItem(it) }
+        return realItems.map { track ->
+            val occ = occurrences.getOrDefault(track.id, 0)
+            occurrences[track.id] = occ + 1
+            SongListItemWrapper.SongItem(track, occ)
+        }
     }
 
     val result = mutableListOf<SongListItemWrapper>()
     var adIndex = 0
 
     for (i in realItems.indices) {
-        result.add(SongListItemWrapper.SongItem(realItems[i]))
+        val track = realItems[i]
+        val occ = occurrences.getOrDefault(track.id, 0)
+        occurrences[track.id] = occ + 1
+        result.add(SongListItemWrapper.SongItem(track, occ))
         val songNumber = i + 1
 
         if (songNumber % 10 == 0) {
@@ -354,614 +690,131 @@ fun buildSongItemsWithAds(
     return result
 }
 
+@Composable
+private fun ManagedNativeAdAndroidView(
+    entry: ManagedAdEntry,
+    factory: (Context) -> NativeAdView,
+    binder: (NativeAdView, NativeAd) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    AndroidView(
+        factory = factory,
+        update = { nativeAdView ->
+            val nativeAd = entry.sdkNativeAd
+            val currentTag = nativeAdView.tag as? Pair<*, *>
+            val boundInstanceId = currentTag?.second as? String
+            if (nativeAd != null && !entry.isDisposed && boundInstanceId != entry.instanceId) {
+                if (currentTag != null) {
+                    val prevUnit = currentTag.first as? String
+                    val prevInstance = currentTag.second as? String
+                    if (prevUnit != null && prevInstance != null) {
+                        AppNativeAdsManager.onViewDetached(
+                            adUnitId = prevUnit,
+                            instanceId = prevInstance,
+                            viewToken = System.identityHashCode(nativeAdView)
+                        )
+                    }
+                }
+                binder(nativeAdView, nativeAd)
+                nativeAdView.tag = entry.adUnitId to entry.instanceId
+                AppNativeAdsManager.onViewAttached(
+                    adUnitId = entry.adUnitId,
+                    instanceId = entry.instanceId,
+                    viewToken = System.identityHashCode(nativeAdView),
+                    placementKey = entry.assignedPlacementKey.orEmpty()
+                )
+            }
+        },
+        onRelease = { nativeAdView ->
+            val currentTag = nativeAdView.tag as? Pair<*, *>
+            val prevUnit = currentTag?.first as? String ?: entry.adUnitId
+            val prevInstance = currentTag?.second as? String ?: entry.instanceId
+            AppNativeAdsManager.onViewDetached(
+                adUnitId = prevUnit,
+                instanceId = prevInstance,
+                viewToken = System.identityHashCode(nativeAdView)
+            )
+            nativeAdView.tag = null
+        },
+        modifier = modifier
+    )
+}
+
 /**
  * Album Card Native Ad layout matching exact size, shape, and style of Album cards.
- * Uses official Google NativeAdView wrapper and includes mandatory "Ad" badge.
+ * Leaves the slot temporarily empty when no unique valid ad is available.
  */
 @Composable
 fun AlbumNativeAdCard(
-    nativeAd: NativeAd?,
+    adEntry: ManagedAdEntry?,
     modifier: Modifier = Modifier
 ) {
+    if (adEntry == null || adEntry.sdkNativeAd == null || adEntry.isDisposed) {
+        Box(modifier = modifier.fillMaxWidth().height(1.dp))
+        return
+    }
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = SpaceCardBg),
         shape = RoundedCornerShape(12.dp)
     ) {
-        if (nativeAd == null) {
-            // Sleek loading placeholder card of identical dimensions
-            Column {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(130.dp)
-                        .background(Color.White.copy(alpha = 0.05f)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "Sponsored",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextMuted.copy(alpha = 0.5f)
-                    )
-                }
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth(0.7f)
-                            .height(14.dp)
-                            .background(Color.White.copy(alpha = 0.1f))
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth(0.5f)
-                            .height(12.dp)
-                            .background(Color.White.copy(alpha = 0.05f))
-                    )
-                }
-            }
-        } else {
-            AndroidView(
-                factory = { context ->
-                    createAlbumNativeAdView(context, nativeAd)
-                },
-                update = { nativeAdView ->
-                    populateAlbumNativeAdView(nativeAdView, nativeAd)
-                },
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
+        ManagedNativeAdAndroidView(
+            entry = adEntry,
+            factory = ::createAlbumNativeAdView,
+            binder = ::bindAlbumNativeAdView,
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
 
 /**
  * Artist Card Native Ad layout matching exact size, shape, and style of Artist cards.
- * Uses official Google NativeAdView wrapper with mandatory "Ad" badge.
+ * Leaves the slot temporarily empty when no unique valid ad is available.
  */
 @Composable
 fun ArtistNativeAdCard(
-    nativeAd: NativeAd?,
+    adEntry: ManagedAdEntry?,
     modifier: Modifier = Modifier
 ) {
+    if (adEntry == null || adEntry.sdkNativeAd == null || adEntry.isDisposed) {
+        Box(modifier = modifier.fillMaxWidth().height(1.dp))
+        return
+    }
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = SpaceCardBg),
         shape = RoundedCornerShape(12.dp)
     ) {
-        if (nativeAd == null) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(72.dp)
-                        .clip(CircleShape)
-                        .background(Color.White.copy(alpha = 0.05f)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "Ad",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextMuted.copy(alpha = 0.5f)
-                    )
-                }
-                Spacer(modifier = Modifier.height(12.dp))
-                Box(
-                    modifier = Modifier
-                        .width(80.dp)
-                        .height(14.dp)
-                        .background(Color.White.copy(alpha = 0.1f))
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-                Box(
-                    modifier = Modifier
-                        .width(60.dp)
-                        .height(10.dp)
-                        .background(Color.White.copy(alpha = 0.05f))
-                )
-            }
-        } else {
-            AndroidView(
-                factory = { context ->
-                    createArtistNativeAdView(context, nativeAd)
-                },
-                update = { nativeAdView ->
-                    populateArtistNativeAdView(nativeAdView, nativeAd)
-                },
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
+        ManagedNativeAdAndroidView(
+            entry = adEntry,
+            factory = ::createArtistNativeAdView,
+            binder = ::bindArtistNativeAdView,
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
 
 /**
  * Song Native Ad Row matching the exact appearance of a song list row/card.
- * Features 44dp rounded cover thumbnail, headline, "Ad" badge + sponsor info,
- * action call-to-action button, and horizontal divider.
+ * Leaves the slot temporarily empty when no unique valid ad is available.
  */
 @Composable
 fun SongNativeAdRow(
-    nativeAd: NativeAd?,
+    adEntry: ManagedAdEntry?,
     modifier: Modifier = Modifier
 ) {
+    if (adEntry == null || adEntry.sdkNativeAd == null || adEntry.isDisposed) {
+        Box(modifier = modifier.fillMaxWidth().height(0.dp))
+        return
+    }
     Column(modifier = modifier.fillMaxWidth()) {
-        if (nativeAd == null) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(44.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Color.White.copy(alpha = 0.05f)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "Ad",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextMuted.copy(alpha = 0.5f)
-                    )
-                }
-                Spacer(modifier = Modifier.width(12.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth(0.6f)
-                            .height(14.dp)
-                            .background(Color.White.copy(alpha = 0.08f), RoundedCornerShape(4.dp))
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth(0.4f)
-                            .height(11.dp)
-                            .background(Color.White.copy(alpha = 0.04f), RoundedCornerShape(4.dp))
-                    )
-                }
-                Spacer(modifier = Modifier.width(8.dp))
-                Box(
-                    modifier = Modifier
-                        .width(48.dp)
-                        .height(24.dp)
-                        .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(12.dp))
-                )
-            }
-        } else {
-            AndroidView(
-                factory = { context ->
-                    createSongNativeAdView(context, nativeAd)
-                },
-                update = { nativeAdView ->
-                    populateSongNativeAdView(nativeAdView, nativeAd)
-                },
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-    }
-}
-
-// Private layout builders for Google AdMob NativeAdView compliance
-
-private fun createAlbumNativeAdView(context: Context, nativeAd: NativeAd): NativeAdView {
-    val nativeAdView = NativeAdView(context)
-    val rootLayout = LinearLayout(context).apply {
-        orientation = LinearLayout.VERTICAL
-        layoutParams = ViewGroup.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
+        ManagedNativeAdAndroidView(
+            entry = adEntry,
+            factory = ::createSongNativeAdView,
+            binder = ::bindSongNativeAdView,
+            modifier = Modifier.fillMaxWidth()
         )
     }
-
-    // Top media container (130dp height matching album cover)
-    val mediaContainer = FrameLayout(context).apply {
-        layoutParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            (130 * context.resources.displayMetrics.density).toInt()
-        )
-        clipToOutline = true
-        val cornerRadiusPx = 12 * context.resources.displayMetrics.density
-        outlineProvider = object : android.view.ViewOutlineProvider() {
-            override fun getOutline(view: android.view.View, outline: android.graphics.Outline) {
-                outline.setRoundRect(0, 0, view.width, view.height, cornerRadiusPx)
-            }
-        }
-    }
-
-    val mediaView = MediaView(context).apply {
-        layoutParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.MATCH_PARENT
-        )
-    }
-
-    val fallbackImageView = ImageView(context).apply {
-        layoutParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.MATCH_PARENT
-        )
-        scaleType = ImageView.ScaleType.CENTER_CROP
-        visibility = android.view.View.GONE
-    }
-
-    mediaContainer.addView(mediaView)
-    mediaContainer.addView(fallbackImageView)
-
-    // Details container (padding 12dp matching album details)
-    val paddingPx = (12 * context.resources.displayMetrics.density).toInt()
-    val detailsLayout = LinearLayout(context).apply {
-        orientation = LinearLayout.VERTICAL
-        setPadding(paddingPx, paddingPx, paddingPx, paddingPx)
-    }
-
-    // Top Row: Ad badge + Headline
-    val topRow = LinearLayout(context).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-    }
-
-    val adBadge = TextView(context).apply {
-        text = "Ad"
-        textSize = 10f
-        setTypeface(null, Typeface.BOLD)
-        setTextColor(android.graphics.Color.WHITE)
-        val bgDrawable = GradientDrawable().apply {
-            setColor(TealPrimary.toArgb())
-            cornerRadius = 4 * context.resources.displayMetrics.density
-        }
-        background = bgDrawable
-        val pxH = (5 * context.resources.displayMetrics.density).toInt()
-        val pxV = (2 * context.resources.displayMetrics.density).toInt()
-        setPadding(pxH, pxV, pxH, pxV)
-    }
-
-    val headlineView = TextView(context).apply {
-        textSize = 14f
-        setTypeface(null, Typeface.BOLD)
-        setTextColor(TextLight.toArgb())
-        maxLines = 1
-        ellipsize = android.text.TextUtils.TruncateAt.END
-        val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-            marginStart = (6 * context.resources.displayMetrics.density).toInt()
-        }
-        layoutParams = lp
-    }
-
-    topRow.addView(adBadge)
-    topRow.addView(headlineView)
-
-    // Body / Advertiser
-    val bodyView = TextView(context).apply {
-        textSize = 12f
-        setTextColor(TextMuted.toArgb())
-        maxLines = 1
-        ellipsize = android.text.TextUtils.TruncateAt.END
-        val lp = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            topMargin = (2 * context.resources.displayMetrics.density).toInt()
-        }
-        layoutParams = lp
-    }
-
-    // Call to Action
-    val ctaView = TextView(context).apply {
-        textSize = 11f
-        setTypeface(null, Typeface.BOLD)
-        setTextColor(TealPrimary.toArgb())
-        maxLines = 1
-        val lp = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            topMargin = (4 * context.resources.displayMetrics.density).toInt()
-        }
-        layoutParams = lp
-    }
-
-    detailsLayout.addView(topRow)
-    detailsLayout.addView(bodyView)
-    detailsLayout.addView(ctaView)
-
-    rootLayout.addView(mediaContainer)
-    rootLayout.addView(detailsLayout)
-    nativeAdView.addView(rootLayout)
-
-    // Register asset views with Google NativeAdView
-    nativeAdView.mediaView = mediaView
-    nativeAdView.headlineView = headlineView
-    nativeAdView.bodyView = bodyView
-    nativeAdView.callToActionView = ctaView
-    nativeAdView.imageView = fallbackImageView
-
-    populateAlbumNativeAdView(nativeAdView, nativeAd)
-    return nativeAdView
-}
-
-private fun populateAlbumNativeAdView(nativeAdView: NativeAdView, nativeAd: NativeAd) {
-    (nativeAdView.headlineView as? TextView)?.text = nativeAd.headline
-    (nativeAdView.bodyView as? TextView)?.text = nativeAd.body ?: nativeAd.advertiser ?: "Sponsored content"
-    (nativeAdView.callToActionView as? TextView)?.text = nativeAd.callToAction ?: "Learn More"
-
-    // Set mediaContent so that MediaView renders the AdMob media asset
-    nativeAdView.mediaView?.mediaContent = nativeAd.mediaContent
-
-    val fallbackImageView = nativeAdView.imageView as? ImageView
-    val imageDrawable = nativeAd.images.firstOrNull()?.drawable ?: nativeAd.icon?.drawable
-    if (nativeAd.mediaContent == null || nativeAd.mediaContent?.aspectRatio == 0f) {
-        if (imageDrawable != null) {
-            fallbackImageView?.setImageDrawable(imageDrawable)
-            fallbackImageView?.visibility = android.view.View.VISIBLE
-        } else {
-            fallbackImageView?.setImageResource(R.drawable.img_app_icon)
-            fallbackImageView?.visibility = android.view.View.VISIBLE
-        }
-    } else {
-        fallbackImageView?.visibility = android.view.View.GONE
-    }
-
-    nativeAdView.setNativeAd(nativeAd)
-}
-
-private fun createArtistNativeAdView(context: Context, nativeAd: NativeAd): NativeAdView {
-    val nativeAdView = NativeAdView(context)
-
-    val paddingPx = (16 * context.resources.displayMetrics.density).toInt()
-    val rootLayout = LinearLayout(context).apply {
-        orientation = LinearLayout.VERTICAL
-        gravity = Gravity.CENTER_HORIZONTAL
-        setPadding(paddingPx, paddingPx, paddingPx, paddingPx)
-        layoutParams = ViewGroup.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        )
-    }
-
-    // Circle Icon (72dp x 72dp)
-    val iconSizePx = (72 * context.resources.displayMetrics.density).toInt()
-    val iconView = ImageView(context).apply {
-        layoutParams = LinearLayout.LayoutParams(iconSizePx, iconSizePx).apply {
-            bottomMargin = (8 * context.resources.displayMetrics.density).toInt()
-        }
-        scaleType = ImageView.ScaleType.CENTER_CROP
-        clipToOutline = true
-        val cornerRadiusPx = 36 * context.resources.displayMetrics.density
-        outlineProvider = object : android.view.ViewOutlineProvider() {
-            override fun getOutline(view: android.view.View, outline: android.graphics.Outline) {
-                outline.setRoundRect(0, 0, view.width, view.height, cornerRadiusPx)
-            }
-        }
-    }
-
-    // Ad Badge
-    val adBadge = TextView(context).apply {
-        text = "Sponsored"
-        textSize = 10f
-        setTypeface(null, Typeface.BOLD)
-        setTextColor(TealPrimary.toArgb())
-        val bgDrawable = GradientDrawable().apply {
-            setColor(SpaceDarkBg.toArgb())
-            cornerRadius = 4 * context.resources.displayMetrics.density
-        }
-        background = bgDrawable
-        val pxH = (6 * context.resources.displayMetrics.density).toInt()
-        val pxV = (2 * context.resources.displayMetrics.density).toInt()
-        setPadding(pxH, pxV, pxH, pxV)
-    }
-
-    // Headline
-    val headlineView = TextView(context).apply {
-        textSize = 14f
-        setTypeface(null, Typeface.BOLD)
-        setTextColor(TextLight.toArgb())
-        gravity = Gravity.CENTER
-        maxLines = 1
-        ellipsize = android.text.TextUtils.TruncateAt.END
-        val lp = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            topMargin = (6 * context.resources.displayMetrics.density).toInt()
-        }
-        layoutParams = lp
-    }
-
-    // Body / CTA
-    val ctaView = TextView(context).apply {
-        textSize = 12f
-        setTextColor(TextMuted.toArgb())
-        gravity = Gravity.CENTER
-        maxLines = 1
-        ellipsize = android.text.TextUtils.TruncateAt.END
-        val lp = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            topMargin = (2 * context.resources.displayMetrics.density).toInt()
-        }
-        layoutParams = lp
-    }
-
-    rootLayout.addView(iconView)
-    rootLayout.addView(adBadge)
-    rootLayout.addView(headlineView)
-    rootLayout.addView(ctaView)
-    nativeAdView.addView(rootLayout)
-
-    nativeAdView.iconView = iconView
-    nativeAdView.headlineView = headlineView
-    nativeAdView.callToActionView = ctaView
-
-    populateArtistNativeAdView(nativeAdView, nativeAd)
-    return nativeAdView
-}
-
-private fun populateArtistNativeAdView(nativeAdView: NativeAdView, nativeAd: NativeAd) {
-    (nativeAdView.headlineView as? TextView)?.text = nativeAd.headline
-    (nativeAdView.callToActionView as? TextView)?.text = nativeAd.callToAction ?: nativeAd.advertiser ?: "Visit Site"
-
-    val iconDrawable = nativeAd.icon?.drawable ?: nativeAd.images.firstOrNull()?.drawable
-    val imageView = nativeAdView.iconView as? ImageView
-    if (iconDrawable != null) {
-        imageView?.setImageDrawable(iconDrawable)
-    } else {
-        imageView?.setImageResource(R.drawable.img_app_icon)
-    }
-    nativeAdView.setNativeAd(nativeAd)
-}
-
-private fun createSongNativeAdView(context: Context, nativeAd: NativeAd): NativeAdView {
-    val nativeAdView = NativeAdView(context)
-    val density = context.resources.displayMetrics.density
-
-    val rootLayout = LinearLayout(context).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        val padH = (16 * density).toInt()
-        val padV = (10 * density).toInt()
-        setPadding(padH, padV, padH, padV)
-        layoutParams = ViewGroup.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        )
-    }
-
-    // 44dp x 44dp cover thumbnail with 8dp rounded corner
-    val iconSizePx = (44 * density).toInt()
-    val iconView = ImageView(context).apply {
-        layoutParams = LinearLayout.LayoutParams(iconSizePx, iconSizePx)
-        scaleType = ImageView.ScaleType.CENTER_CROP
-        clipToOutline = true
-        val cornerRadiusPx = 8 * density
-        outlineProvider = object : android.view.ViewOutlineProvider() {
-            override fun getOutline(view: android.view.View, outline: android.graphics.Outline) {
-                outline.setRoundRect(0, 0, view.width, view.height, cornerRadiusPx)
-            }
-        }
-    }
-
-    val spacer = android.view.View(context).apply {
-        layoutParams = LinearLayout.LayoutParams((12 * density).toInt(), 1)
-    }
-
-    // Text details matching song title and artist/album line
-    val centerCol = LinearLayout(context).apply {
-        orientation = LinearLayout.VERTICAL
-        layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-    }
-
-    val headlineView = TextView(context).apply {
-        textSize = 14f
-        setTypeface(null, Typeface.BOLD)
-        setTextColor(TextLight.toArgb())
-        maxLines = 1
-        ellipsize = android.text.TextUtils.TruncateAt.END
-    }
-
-    val subRow = LinearLayout(context).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        layoutParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            topMargin = (2 * density).toInt()
-        }
-    }
-
-    val adBadge = TextView(context).apply {
-        text = "Ad"
-        textSize = 9f
-        setTypeface(null, Typeface.BOLD)
-        setTextColor(android.graphics.Color.WHITE)
-        val bgDrawable = GradientDrawable().apply {
-            setColor(TealPrimary.toArgb())
-            cornerRadius = 3 * density
-        }
-        background = bgDrawable
-        val pxH = (4 * density).toInt()
-        val pxV = (1 * density).toInt()
-        setPadding(pxH, pxV, pxH, pxV)
-    }
-
-    val bodyView = TextView(context).apply {
-        textSize = 12f
-        setTextColor(TextMuted.toArgb())
-        maxLines = 1
-        ellipsize = android.text.TextUtils.TruncateAt.END
-        val lp = LinearLayout.LayoutParams(
-            0,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            1f
-        ).apply {
-            marginStart = (6 * density).toInt()
-        }
-        layoutParams = lp
-    }
-
-    subRow.addView(adBadge)
-    subRow.addView(bodyView)
-
-    centerCol.addView(headlineView)
-    centerCol.addView(subRow)
-
-    // Call To Action button styled as sleek action button
-    val ctaView = TextView(context).apply {
-        textSize = 11f
-        setTypeface(null, Typeface.BOLD)
-        setTextColor(TealPrimary.toArgb())
-        gravity = Gravity.CENTER
-        val lp = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            marginStart = (8 * density).toInt()
-        }
-        layoutParams = lp
-        val bgDrawable = GradientDrawable().apply {
-            setColor(SpaceCardBg.toArgb())
-            cornerRadius = 12 * density
-            setStroke((1 * density).toInt(), TealPrimary.copy(alpha = 0.5f).toArgb())
-        }
-        background = bgDrawable
-        val pxH = (10 * density).toInt()
-        val pxV = (4 * density).toInt()
-        setPadding(pxH, pxV, pxH, pxV)
-    }
-
-    rootLayout.addView(iconView)
-    rootLayout.addView(spacer)
-    rootLayout.addView(centerCol)
-    rootLayout.addView(ctaView)
-
-    nativeAdView.addView(rootLayout)
-
-    nativeAdView.iconView = iconView
-    nativeAdView.headlineView = headlineView
-    nativeAdView.bodyView = bodyView
-    nativeAdView.callToActionView = ctaView
-
-    populateSongNativeAdView(nativeAdView, nativeAd)
-    return nativeAdView
-}
-
-private fun populateSongNativeAdView(nativeAdView: NativeAdView, nativeAd: NativeAd) {
-    (nativeAdView.headlineView as? TextView)?.text = nativeAd.headline
-    (nativeAdView.bodyView as? TextView)?.text = nativeAd.advertiser ?: nativeAd.body ?: "Sponsored"
-    (nativeAdView.callToActionView as? TextView)?.text = nativeAd.callToAction?.uppercase() ?: "OPEN"
-
-    val iconDrawable = nativeAd.icon?.drawable ?: nativeAd.images.firstOrNull()?.drawable
-    val imageView = nativeAdView.iconView as? ImageView
-    if (iconDrawable != null) {
-        imageView?.setImageDrawable(iconDrawable)
-    } else {
-        imageView?.setImageResource(R.drawable.img_app_icon)
-    }
-    nativeAdView.setNativeAd(nativeAd)
 }
 
 /**
@@ -970,13 +823,31 @@ private fun populateSongNativeAdView(nativeAdView: NativeAdView, nativeAd: Nativ
 @Composable
 fun PlaylistNativeAdCard(
     modifier: Modifier = Modifier,
-    adUnitId: String = NATIVE_AD_UNIT_5
+    adUnitId: String = NATIVE_AD_UNIT_5,
+    screenKey: String = "playlists_bottom"
 ) {
-    val loadedAds = rememberNativeAds(itemCount = 1, adUnitId = adUnitId, cadence = 1)
-    val nativeAd = loadedAds.firstOrNull()
+    rememberNativeAdScreenDemand(
+        screenKey = screenKey,
+        itemCount = 1,
+        adUnitId = adUnitId,
+        cadence = 1,
+        maxSlots = 1
+    )
+    val slot = rememberManagedNativeAdSlot(
+        screenKey = screenKey,
+        adUnitId = adUnitId,
+        adIndex = 0
+    )
+
+    val entry = slot.entry
+    if (entry == null || entry.sdkNativeAd == null || entry.isDisposed) {
+        Box(modifier = modifier.fillMaxWidth().height(0.dp))
+        return
+    }
 
     Card(
         modifier = modifier
+            .then(slot.visibilityModifier)
             .fillMaxWidth()
             .padding(vertical = 4.dp),
         shape = RoundedCornerShape(16.dp),
@@ -984,7 +855,7 @@ fun PlaylistNativeAdCard(
         border = BorderStroke(1.dp, TealPrimary.copy(alpha = 0.25f))
     ) {
         SongNativeAdRow(
-            nativeAd = nativeAd,
+            adEntry = entry,
             modifier = Modifier.padding(vertical = 4.dp)
         )
     }
